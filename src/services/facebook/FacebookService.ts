@@ -9,7 +9,8 @@ import {
   FBReactionAction, FBAttachmentUploadResult, FBThread, FBMQTTMessage,
   FBE2EEStatus, FBE2EEMessageRaw,
 } from './FacebookTypes';
-import { initSession, fetchUserAvatarFromProfile, getUserInfoFacebookHtml } from './FacebookSession';
+import { getFacebookAvatarById, initSession } from './FacebookSession';
+import { getFacebookUserInfo } from './FacebookUserInfo';
 import { sendMessage as sendMessageREST, unsendMessage, addReaction, editMessage, forwardMessage, pinMessage, unpinMessage, createPoll, votePoll } from './FacebookMessageSender';
 import { uploadAttachment } from './FacebookAttachment';
 import {
@@ -22,7 +23,7 @@ import { blockUser, unblockUser } from './FacebookBlock';
 import { changeThreadTheme } from './FacebookChangeTheme';
 import { createNote } from './FacebookCreateNotes';
 import { FacebookMQTTListener } from './FacebookMQTTListener';
-import { FacebookE2EEBridge } from './FacebookE2EEBridge';
+import { FacebookE2EEBridge, BridgeInitialData } from './FacebookE2EEBridge';
 import { FacebookE2EESender } from './FacebookE2EESender';
 import { parseE2EECookies, resolveE2EEBinaryPath, normalizeChatJid } from './FacebookUtils';
 import { FacebookE2EEStateStore } from './FacebookE2EEStateStore';
@@ -43,8 +44,25 @@ function fbCookieKey(accountId: string): string {
   return `fb_cookie_${accountId}`;
 }
 
+/** Compare signed Facebook CDN URLs without treating unrelated image URLs as equal. */
+function isSameFacebookAvatar(left?: string, right?: string): boolean {
+  if (!left || !right) return false;
+  if (left === right) return true;
+  try {
+    const a = new URL(left);
+    const b = new URL(right);
+    const aHash = a.searchParams.get('oh');
+    const bHash = b.searchParams.get('oh');
+    return !!aHash && aHash === bHash;
+  } catch {
+    return false;
+  }
+}
+
 export class FacebookService {
   private static instances = new Map<string, FacebookService>();
+  /** In-flight getInstance/connect per account — see FB-03 (no zombie instance). */
+  private static pendingConnections = new Map<string, Promise<FacebookService>>();
 
   private accountId: string;
   private cookie: string;
@@ -82,6 +100,10 @@ export class FacebookService {
   private e2eeBridgeGen: number = 0;
   /** Heartbeat timer kiểm tra bridge còn responsive không (BUG #8 fix) */
   private _e2eeHeartbeatTimer: ReturnType<typeof setInterval> | null = null;
+  /** Debounced recovery after the E2EE socket disconnects while the process lives. */
+  private _e2eeReconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  /** Consecutive automatic reconnects; prevents a failed handshake from churning every 5s. */
+  private _e2eeReconnectAttempts: number = 0;
   /** Đếm số lần heartbeat fail liên tiếp - sau 2 lần → kill + respawn */
   private _e2eeHeartbeatFailCount: number = 0;
   /** Track message IDs sent locally via this service instance.
@@ -153,26 +175,48 @@ export class FacebookService {
     // Luôn resolve về internal UUID để tránh duplicate instance
     const instanceKey = FacebookService.resolveInstanceKey(accountId);
 
-    if (!FacebookService.instances.has(instanceKey)) {
+    const existing = FacebookService.instances.get(instanceKey);
+    if (existing) return existing;
+
+    // FB-03: single-flight creation. A failed connect() must not leave a
+    // zombie instance in the static map — callers would keep receiving it as
+    // if it were ready and every later attempt would silently no-op.
+    const inFlight = FacebookService.pendingConnections.get(instanceKey);
+    if (inFlight) return inFlight;
+
+    const task = (async (): Promise<FacebookService> => {
+      let instanceCookie = cookie;
       // Nếu không có cookie, thử lấy từ secure storage
-      if (!cookie) {
+      if (!instanceCookie) {
         try {
           // Sử dụng instanceKey (đã resolve) để lookup cookie
-          cookie = secureGet(fbCookieKey(instanceKey)) || undefined;
+          instanceCookie = secureGet(fbCookieKey(instanceKey)) || undefined;
           // Fallback: lấy từ DB (cookie_encrypted)
-          if (!cookie) {
+          if (!instanceCookie) {
             const acc = DatabaseService.getInstance().getFBAccount(instanceKey);
-            if (acc?.cookie_encrypted) cookie = acc.cookie_encrypted;
+            if (acc?.cookie_encrypted) instanceCookie = acc.cookie_encrypted;
           }
         } catch {}
       }
-      if (!cookie) throw new Error(`[FacebookService] Cookie required for new instance: ${accountId}`);
-      const service = new FacebookService(instanceKey, cookie, proxyId);
+      if (!instanceCookie) throw new Error(`[FacebookService] Cookie required for new instance: ${accountId}`);
+      const service = new FacebookService(instanceKey, instanceCookie, proxyId);
+      try {
+        // Tự động kết nối. Only publish the instance once connect() has
+        // finished; a thrown connect leaves nothing behind to poison the map.
+        await service.connect();
+      } catch (err) {
+        await service.disconnect().catch(() => {});
+        throw err;
+      }
       FacebookService.instances.set(instanceKey, service);
-      // Tự động kết nối
-      await service.connect();
-    }
-    return FacebookService.instances.get(instanceKey)!;
+      return service;
+    })().finally(() => {
+      if (FacebookService.pendingConnections.get(instanceKey) === task) {
+        FacebookService.pendingConnections.delete(instanceKey);
+      }
+    });
+    FacebookService.pendingConnections.set(instanceKey, task);
+    return task;
   }
 
   public static async removeInstance(accountId: string): Promise<void> {
@@ -490,7 +534,14 @@ export class FacebookService {
       return true;
     } catch (err: any) {
       const message = String(err?.message || err || '');
-      const transientNetworkError = /\b(?:ENOTFOUND|EAI_AGAIN|ECONNRESET|ECONNREFUSED|ECONNABORTED|ETIMEDOUT|EHOSTUNREACH|ENETUNREACH)\b|\b(?:network|socket|fetch failed|timeout)\b/i.test(message);
+      // FB-04: only an authentication rejection may be read as "cookie
+      // expired". DNS/socket/timeout and server-side 429/5xx (including a
+      // captive portal or a proxy error page) are transient — reporting them
+      // as expired permanently stops the listener as if the user had logged out.
+      const transientNetworkError =
+        /\b(?:ENOTFOUND|EAI_AGAIN|ECONNRESET|ECONNREFUSED|ECONNABORTED|ETIMEDOUT|EHOSTUNREACH|ENETUNREACH)\b|\b(?:network|socket|fetch failed|timeout)\b/i.test(message)
+        || /\b(?:status code\s*429|status code\s*5\d\d|too many requests|service unavailable|bad gateway|gateway timeout)\b/i.test(message)
+        || /\b(?:429|500|502|503|504)\b/.test(message) && /\b(?:status|http|code)\b/i.test(message);
       if (transientNetworkError) {
         Logger.warn(`[FacebookService:${this.accountId}] Cookie health check deferred because network is unavailable: ${message}`);
         return true;
@@ -512,7 +563,21 @@ export class FacebookService {
   private async handleIncomingMessage(msg: FBMQTTMessage): Promise<void> {
     const threadId = msg.replyToID && msg.replyToID !== '0' ? msg.replyToID : null;
     const ts = parseInt(msg.timestamp) || Date.now();
-    const isSelf = this.dataFB?.FacebookID && msg.userID === this.dataFB.FacebookID ? 1 : 0;
+    // The MQTT actor is the source of truth for the sender.  Do not use the
+    // active account as a fallback here: doing so turns an incoming message
+    // into a self-sent message when Messenger returns identity variants.
+    const normalizeFacebookId = (value: unknown): string => String(value ?? '').trim().replace(/@.*$/, '');
+    const senderId = normalizeFacebookId(msg.userID);
+    const persistedAccountId = normalizeFacebookId(this.getFacebookId());
+    const sessionAccountId = normalizeFacebookId(this.dataFB?.FacebookID);
+    // getFacebookId() is the persisted account identity.  Only use the
+    // session identity while the persisted value has not been initialized.
+    const ownId = /^\d+$/.test(persistedAccountId) ? persistedAccountId : sessionAccountId;
+    const isSelf = senderId !== '' && ownId !== '' && senderId === ownId ? 1 : 0;
+
+    if (senderId) {
+      msg.userID = senderId;
+    }
 
     // ── Self-echo dedup: skip messages we already saved+broadcast locally ──
     // Khi gửi tin qua bridge (E2EE hoặc MQTT), bridge echo ngược lại message
@@ -572,8 +637,8 @@ export class FacebookService {
       try {
         const db = DatabaseService.getInstance();
         const existingSender = db.queryOne?.(
-          `SELECT display_name FROM contacts WHERE contact_id = ? AND channel = 'facebook' AND display_name != '' LIMIT 1`,
-          [String(msg.userID)]
+          `SELECT display_name FROM contacts WHERE owner_zalo_id = ? AND contact_id = ? AND channel = 'facebook' AND display_name != '' LIMIT 1`,
+          [this.getFacebookId(), String(msg.userID)]
         ) as { display_name?: string } | undefined;
         if (!existingSender?.display_name) {
           // Chưa có tên → fetch trước khi save để broadcast có thông tin đầy đủ
@@ -633,17 +698,6 @@ export class FacebookService {
           }]);
         }
 
-        // Human-readable preview for last_message display
-        // 'gif' comes from E2EE bridge (Go sets att.Type="gif" when GifPlayback=true)
-        // Also handle 'sticker' from E2EE bridge attachment type
-        const attachmentPreview = msgType === 'image' ? '🖼️ Hình ảnh'
-          : msgType === 'gif' ? '🖼️ GIF'
-          : msgType === 'video' ? '🎬 Video'
-          : msgType === 'audio' ? '🎵 Audio'
-          : rawType === 'sticker' ? '🎨 Sticker'
-          : msg.attachments?.name ? `📎 ${msg.attachments.name}`
-          : '📎 Tệp đính kèm';
-
         if (msgType === 'sticker') {
           Logger.log(`[FacebookService:${this.accountId}] [STICKER] handleIncomingMessage: msgId=${msg.messageID} threadId=${threadId} rawType=${rawType} msgType=${msgType} hasAttachment=${hasAttachment} url=${(msg.attachments?.url || '').slice(0,100)}`);
         }
@@ -668,43 +722,29 @@ export class FacebookService {
 
         // Note: fb_threads preview is updated inside saveFBMessage
 
-        // Sync to unified contacts table
-        const fbThread = db.queryOne?.(`SELECT name, type FROM fb_threads WHERE id = ? AND account_id = ?`, [threadId, this.accountId]) as any;
-        let threadName = fbThread?.name || '';
-        const contactType = fbThread?.type === 'group' ? 'group' : 'user';
-        const fbIdForContacts = this.getFacebookId();
-
-        // For 1:1 user contacts with no thread name (e.g. newly discovered E2EE thread),
-        // try to resolve from existing contacts table
-        if (!threadName && contactType === 'user') {
-          const existingContact = db.queryOne?.(
-            `SELECT display_name FROM contacts WHERE contact_id = ? AND channel = 'facebook' AND display_name != '' LIMIT 1`,
-            [threadId]
-          ) as { display_name?: string } | undefined;
-          if (existingContact?.display_name) {
-            threadName = existingContact.display_name;
-          }
-        }
-
-        const lastMsgText = msg.body || (hasAttachment ? attachmentPreview : '');
-        Logger.log(`[FacebookService:${this.accountId}] Syncing contacts: owner=${fbIdForContacts} thread=${threadId} name=${threadName} type=${contactType}`);
-        db.run?.(
-          `INSERT INTO contacts (owner_zalo_id, contact_id, display_name, avatar_url, is_friend, contact_type, unread_count, last_message, last_message_time, channel)
-           VALUES (?, ?, ?, '', 0, ?, ?, ?, ?, 'facebook')
-           ON CONFLICT(owner_zalo_id, contact_id) DO UPDATE SET
-             display_name = CASE WHEN excluded.display_name != '' AND contacts.display_name = '' THEN excluded.display_name ELSE contacts.display_name END,
-             last_message = excluded.last_message,
-             last_message_time = excluded.last_message_time,
-             unread_count = CASE WHEN ? = 0 THEN contacts.unread_count + 1 ELSE contacts.unread_count END,
-             channel = 'facebook'`,
-          [this.getFacebookId(), threadId, threadName, contactType, isSelf ? 0 : 1, lastMsgText.slice(0, 200), ts, isSelf]
-        );
+        // saveFBMessage owns the unified contact update. Keeping a second
+        // update here caused every received realtime message to increment the
+        // unread counter twice.
       } catch (err: any) {
         Logger.warn(`[FacebookService:${this.accountId}] DB persist error: ${err.message}`);
       }
 
-      // Fire-and-forget: nếu là user 1-1 chưa có tên, fetch từ HTML
-      if (msg.userID && /^\d+$/.test(msg.userID)) {
+      // For a direct Page/person thread, resolve the conversation identity,
+      // not the message actor. A Page can send as the logged-in account, so
+      // using msg.userID here would copy that account's avatar to the thread.
+      try {
+        const knownThread = DatabaseService.getInstance().queryOne?.(
+          `SELECT type FROM fb_threads WHERE id = ? AND account_id = ?`,
+          [threadId, this.accountId],
+        ) as { type?: string } | undefined;
+        if (knownThread?.type !== 'group' && /^\d+$/.test(threadId)) {
+          this.checkAndFetchUserInfo(threadId);
+        }
+      } catch {}
+
+      // Keep sender data for group participant lookup only. It is never used
+      // as the avatar source for the conversation row above.
+      if (msg.userID && /^\d+$/.test(msg.userID) && msg.userID !== threadId) {
         this.checkAndFetchUserInfo(msg.userID);
       }
 
@@ -1048,10 +1088,30 @@ export class FacebookService {
       Logger.log(`[FacebookService:${this.accountId}] E2EE bridge connected: user=${JSON.stringify((info as any)?.user?.id ?? '?')}`);
 
       Logger.log(`[FacebookService:${this.accountId}] E2EE startup: connectE2EE`);
-      await this.e2eeBridge.connectE2EE(20000);
+      // Pairing may need to restore encrypted session state after a desktop
+      // restart. The bridge's supported timeout is 60s; the old 20s deadline
+      // killed a healthy in-progress connection and forced a manual toggle.
+      await this.e2eeBridge.connectE2EE(60_000);
+      const readiness = await bridgeInstance.call('isConnected', {}, 5_000) as {
+        connected?: boolean;
+        e2eeConnected?: boolean;
+      };
+      // The normal Messenger transport is handled by FacebookMQTTListener. The
+      // bridge's LightSpeed connection can remain false on valid cookie sessions
+      // while its independent encrypted socket is healthy, so it must not gate
+      // encrypted message reception.
+      if (readiness.e2eeConnected !== true) {
+        throw new Error(`E2EE handshake incomplete (e2eeConnected=${readiness.e2eeConnected})`);
+      }
       Logger.log(`[FacebookService:${this.accountId}] E2EE pairing complete`);
 
+      // A failed handshake retries automatically. Do not re-persist the same
+      // bridge inbox on every failed attempt; on large databases that creates
+      // constant writes and log traffic while no encrypted socket is usable.
+      this.persistBridgeHistory(info.initialData);
       this.setE2EEStatus('connected');
+      this._e2eeReconnectAttempts = 0;
+      this._clearE2EEReconnect();
 
       // 5. Create sender (reuses bridge)
       this.e2eeSender = new FacebookE2EESender({ mode: 'reuse', bridge: this.e2eeBridge });
@@ -1066,18 +1126,7 @@ export class FacebookService {
           this.e2eeBridge = null;
         }
         this.setE2EEStatus('disconnected');
-        // Auto-reconnect nếu service vẫn connected và bridge chưa được thay thế
-        if (this.isConnected()) {
-          Logger.log(`[FacebookService:${this.accountId}] E2EE bridge closed - attempting reconnect in 10s...`);
-          metricInc('fb_bridge_restart', this.accountId);
-          setTimeout(() => {
-            // BUG #6 fix: chỉ reconnect nếu bridge instance không thay đổi
-            // và e2eeBridgeGen không tăng (không có bridge mới được tạo)
-            if (this.isConnected() && this.e2eeBridgeGen === bridgeGen && !this.e2eeBridge?.isAlive()) {
-              this.startE2EEBridge(fbId).catch(() => {});
-            }
-          }, 10000);
-        }
+        this._scheduleE2EEReconnect('bridge process closed', 3_000);
       });
 
       this.e2eeBridge.on('error', (err: Error) => {
@@ -1097,20 +1146,12 @@ export class FacebookService {
       this.e2eeSender = null;
       this.setE2EEStatus('error');
       // NON-FATAL: groups still work via MQTT
-      // Auto-retry sau 30s nếu service vẫn connected (BUG #10 fix)
-      if (this.isConnected() || this.status === 'connecting') {
-        Logger.log(`[FacebookService:${this.accountId}] E2EE bridge init failed - will retry in 30s`);
-        const currentGen = this.e2eeBridgeGen;
-        setTimeout(() => {
-          if ((this.isConnected() || this.status === 'connecting') && this.e2eeBridgeGen === currentGen) {
-            this.startE2EEBridge(fbId).catch(() => {});
-          }
-        }, 30000);
-      }
+      this._scheduleE2EEReconnect('startup failed', 5_000);
     }
   }
 
   private async stopE2EEBridge(): Promise<void> {
+    this._clearE2EEReconnect();
     this._clearE2EEHeartbeat();
     // Phase 5: Stop event pipeline
     await this.eventPipeline.stop(true).catch(() => {});
@@ -1122,6 +1163,9 @@ export class FacebookService {
       await this.e2eeBridge.close().catch(() => {});
       this.e2eeBridge = null;
     }
+    // close() emits the normal "closed" listener too. A deliberate stop
+    // (toggle, retry, shutdown) must not leave its reconnect timer behind.
+    this._clearE2EEReconnect();
     this.e2eeSender = null;
     this.setE2EEStatus('disconnected');
   }
@@ -1138,10 +1182,18 @@ export class FacebookService {
       }
       try {
         // Gọi isConnected với timeout 5s - nếu bridge treo, call() sẽ timeout
-        await Promise.race([
+        const probe = await Promise.race([
           bridgeInstance.call('isConnected', {}, 5000),
           new Promise((_, reject) => setTimeout(() => reject(new Error('heartbeat_timeout')), 6000)),
         ]);
+        // A well-formed RPC response alone is not proof that the encrypted
+        // transport is healthy. Do not use the bridge's normal LightSpeed
+        // state here: regular Facebook messages use FacebookMQTTListener and
+        // this bridge can receive E2EE while LightSpeed remains disconnected.
+        const e2eeConnected = (probe as any)?.e2eeConnected;
+        if (e2eeConnected !== true) {
+          throw new Error(`bridge reports encrypted socket disconnected (e2ee=${e2eeConnected})`);
+        }
         this._e2eeHeartbeatFailCount = 0; // Reset on success
       } catch {
         this._e2eeHeartbeatFailCount++;
@@ -1154,14 +1206,7 @@ export class FacebookService {
             bridgeInstance.close().catch(() => {});
             this.e2eeBridge = null;
           }
-          // Trigger reconnect (same as 'closed' handler)
-          if (this.isConnected()) {
-            setTimeout(() => {
-              if (this.isConnected() && this.e2eeBridgeGen === bridgeGen && !this.e2eeBridge?.isAlive()) {
-                this.startE2EEBridge(fbId).catch(() => {});
-              }
-            }, 5000);
-          }
+          this._scheduleE2EEReconnect('heartbeat failed', 1_000);
         }
       }
     }, 30000); // Check mỗi 30s
@@ -1173,6 +1218,32 @@ export class FacebookService {
       this._e2eeHeartbeatTimer = null;
     }
     this._e2eeHeartbeatFailCount = 0;
+  }
+
+  /** Restart a stale E2EE transport once; all paths share retryE2EE serialization. */
+  private _scheduleE2EEReconnect(reason: string, delayMs: number): void {
+    if (!this.e2eeEnabled || (!this.isConnected() && this.status !== 'connecting')) return;
+    if (this._e2eeReconnectTimer) return;
+
+    const scheduledGeneration = this.e2eeBridgeGen;
+    const attempt = this._e2eeReconnectAttempts++;
+    const retryDelayMs = Math.min(Math.max(delayMs, 5_000) * (2 ** attempt), 5 * 60_000);
+    Logger.warn(`[FacebookService:${this.accountId}] E2EE ${reason}; reconnecting in ${Math.round(retryDelayMs / 1000)}s (attempt ${attempt + 1})`);
+    metricInc('fb_bridge_restart', this.accountId);
+    this._e2eeReconnectTimer = setTimeout(() => {
+      this._e2eeReconnectTimer = null;
+      if (!this.e2eeEnabled || this.isE2EEConnected() || this.e2eeBridgeGen !== scheduledGeneration) return;
+      this.retryE2EE().catch((err: any) => {
+        Logger.warn(`[FacebookService:${this.accountId}] Scheduled E2EE reconnect failed: ${err.message}`);
+      });
+    }, retryDelayMs);
+  }
+
+  private _clearE2EEReconnect(): void {
+    if (this._e2eeReconnectTimer) {
+      clearTimeout(this._e2eeReconnectTimer);
+      this._e2eeReconnectTimer = null;
+    }
   }
 
   /**
@@ -1197,6 +1268,75 @@ export class FacebookService {
       default:
         return EventPriority.NORMAL;
     }
+  }
+
+  /**
+   * Persist data from the bridge inbox page without emitting fb:onMessage.
+   * These rows are history, so they must not replay automations after a restart
+   * or when the user explicitly reloads Facebook.
+   */
+  private persistBridgeHistory(data?: BridgeInitialData): { threads: number; messages: number } {
+    if (!data) return { threads: 0, messages: 0 };
+    const db = DatabaseService.getInstance();
+    const threads = Array.isArray(data.threads) ? data.threads : [];
+    const messages = Array.isArray(data.messages) ? data.messages : [];
+
+    if (threads.length > 0) {
+      for (const thread of threads) {
+        const rawType = Number(thread?.type);
+        if ((rawType === 15 || rawType === 16) && thread?.id !== undefined && thread?.id !== null) {
+          this.e2eeThreads.add(String(thread.id));
+        }
+      }
+      db.saveFBThreads(this.accountId, threads
+        .filter(thread => thread?.id !== undefined && thread?.id !== null)
+        .map(thread => {
+          const rawType = Number(thread.type);
+          return {
+            id: String(thread.id),
+            account_id: this.accountId,
+            name: String(thread.name || ''),
+            type: rawType === 2 || rawType === 16 ? 'group' : 'user',
+            participant_count: 0,
+            last_message_preview: thread.snippet || '',
+            last_message_at: Number(thread.lastActivityTimestampMs || 0),
+            unread_count: 0,
+            is_muted: false,
+            is_e2ee: rawType === 15 || rawType === 16 ? 1 : 0,
+          };
+        }), { preserveUnread: true });
+    }
+
+    const ownFacebookId = String(this.getFacebookId());
+    let savedMessages = 0;
+    for (const message of messages) {
+      const id = String(message?.id || '');
+      const threadId = String(message?.threadId ?? '');
+      if (!id || !threadId) continue;
+      const senderId = String(message.senderId ?? '');
+      const attachments = Array.isArray(message.attachments) ? message.attachments : [];
+      const type = String(attachments[0]?.type || 'text');
+      db.saveFBMessage({
+        id,
+        account_id: this.accountId,
+        thread_id: threadId,
+        sender_id: senderId,
+        body: message.text || null,
+        timestamp: Number(message.timestampMs || Date.now()),
+        type,
+        attachments: JSON.stringify(attachments),
+        reply_to_id: message.replyTo?.messageId || '',
+        is_self: senderId !== '' && senderId === ownFacebookId ? 1 : 0,
+        is_unsent: 0,
+        is_history: true,
+      });
+      savedMessages += 1;
+    }
+
+    if (threads.length || savedMessages) {
+      Logger.log(`[FacebookService:${this.accountId}] Persisted bridge history: ${threads.length} threads, ${savedMessages} messages`);
+    }
+    return { threads: threads.length, messages: savedMessages };
   }
 
   /**
@@ -1232,6 +1372,8 @@ export class FacebookService {
       case 'e2eeConnected':
         Logger.log(`[FacebookService:${this.accountId}] E2EE bridge: e2eeConnected`);
         this.setE2EEStatus('connected');
+        this._e2eeReconnectAttempts = 0;
+        this._clearE2EEReconnect();
         break;
 
       case 'disconnected':
@@ -1239,13 +1381,23 @@ export class FacebookService {
         // The process can stay alive while its internal LightSpeed socket is
         // offline. Do not report that stale bridge as ready for a new send.
         this.setE2EEStatus('disconnected');
+        if (data?.isE2EE === true) {
+          // whatsmeow has dropped specifically. Waiting for the 30-second
+          // heartbeat left encrypted inbound messages unavailable until the
+          // user manually toggled the dashboard control.
+          this._scheduleE2EEReconnect('encrypted socket disconnected', 1_000);
+        }
         break;
 
       case 'reconnected':
         // Meta's LightSpeed socket owns its own reconnect loop. Do not spawn a
         // second bridge here: that would create two device/socket lifecycles.
+        // LightSpeed (messagix) is the NON-E2EE transport — see
+        // bridge/events.go RawEventSourceLightSpeed. Its reconnect must not be
+        // reported as E2EE ready; only the whatsmeow `e2eeConnected` event (or
+        // a healthy isConnected probe) may do that. Otherwise sends queue on a
+        // bridge that cannot yet encrypt (FB-01).
         Logger.log(`[FacebookService:${this.accountId}] E2EE bridge LightSpeed socket reconnected`);
-        this.setE2EEStatus('connected');
         break;
 
       case 'error':
@@ -1690,7 +1842,7 @@ export class FacebookService {
   }
 
   /**
-   * Kiểm tra contact đã có tên chưa, nếu chưa thì fetch từ Facebook HTML.
+   * Kiểm tra contact đã có tên chưa, nếu chưa thì fetch qua endpoint UID-keyed.
    * Fire-and-forget - gọi khi nhận message đầu tiên, update DB sau đó.
    * Chỉ áp dụng cho user 1-1 (group không support).
    */
@@ -1698,17 +1850,22 @@ export class FacebookService {
     try {
       // Check DB trước: nếu đã có tên và avatar thì skip
       const db = DatabaseService.getInstance();
+      const fbId = this.getFacebookId();
       const existing = db.queryOne?.(
-        `SELECT display_name, avatar_url FROM contacts WHERE contact_id = ? AND channel = 'facebook' LIMIT 1`,
-        [fbUserId]
+        `SELECT display_name, avatar_url FROM contacts
+         WHERE owner_zalo_id = ? AND contact_id = ? AND channel = 'facebook' LIMIT 1`,
+        [fbId, fbUserId]
       ) as { display_name?: string; avatar_url?: string } | undefined;
-      if (existing?.display_name && existing?.avatar_url) return;
+      const accountAvatar = db.queryOne?.(
+        `SELECT avatar_url FROM fb_accounts WHERE id = ?`,
+        [this.accountId],
+      ) as { avatar_url?: string } | undefined;
+      if (existing?.display_name && existing?.avatar_url
+        && !isSameFacebookAvatar(existing.avatar_url, accountAvatar?.avatar_url)) return;
 
-      const session = this.requireSession();
-      const info = await getUserInfoFacebookHtml(session.cookieFacebook, fbUserId);
+      const info = await this.resolveFacebookUserInfo(fbUserId);
       if (!info || (!info.name && !info.avatarUrl)) return;
       Logger.log(`[FacebookService:${this.accountId}] checkAndFetchUserInfo: ${fbUserId} → name="${info.name}"`);
-      const fbId = this.getFacebookId();
       if (info.name) {
         db.run?.(
           `INSERT INTO contacts (owner_zalo_id, contact_id, display_name, avatar_url, is_friend, contact_type, unread_count, last_message, last_message_time, channel)
@@ -1872,6 +2029,20 @@ export class FacebookService {
     }
   }
 
+  /** Enable or stop the optional E2EE bridge without reconnecting MQTT. */
+  public async setE2EEEnabled(enabled: boolean): Promise<void> {
+    if (!enabled) {
+      this.e2eeEnabled = false;
+      await this.stopE2EEBridge();
+      this.setE2EEStatus('disconnected');
+      return;
+    }
+
+    // `retryE2EE` owns the serialized stop/start path and verifies that the
+    // bridge has completed its E2EE handshake before reporting success.
+    await this.retryE2EE();
+  }
+
   // ─── E2EE Public Methods ──────────────────────────────────────────────────
 
   /**
@@ -1894,7 +2065,7 @@ export class FacebookService {
         this.retryE2EE(),
         new Promise<void>((_, reject) => {
           // The startup path has three bounded bridge RPCs: newClient (25s),
-          // connect (30s), and connectE2EE (20s). The old 20s wrapper fired
+          // connect (30s), and connectE2EE (60s). The old 20s wrapper fired
           // while a healthy reconnect was still in progress, leaving the
           // shared retry promise wedged after resume from sleep.
           timer = setTimeout(() => reject(new Error('E2EE reconnect timed out after 80s')), 80_000);
@@ -2330,6 +2501,17 @@ export class FacebookService {
               : 'E2EE đang kết nối lại. Vui lòng thử lại sau vài giây.',
           };
         }
+
+        // The bridge was available but its encrypted handshake did not finish.
+        // A REST probe in this state is invalid for modern 1:1 Messenger chats
+        // and merely turns the real connection problem into Facebook's opaque
+        // "conversation disabled" error. Preserve the actionable E2EE status.
+        if (e2eeRecoveryError) {
+          return {
+            success: false,
+            error: `E2EE đang kết nối lại: ${e2eeRecoveryError}`,
+          };
+        }
       }
 
       // ── PATH B: REST probe (only for threads not yet known as E2EE) ──
@@ -2522,9 +2704,86 @@ export class FacebookService {
   }
 
   /**
+   * Repair contacts that have no avatar or inherited the account avatar.
+   * This runs after an explicit inbox reload, so old incorrect rows are fixed
+   * without issuing profile requests for every healthy conversation.
+   */
+  public async refreshSuspectThreadAvatars(threadIds: string[]): Promise<number> {
+    const session = this.requireSession();
+    const db = DatabaseService.getInstance();
+    const ownerId = this.getFacebookId();
+    const account = db.queryOne?.(
+      `SELECT avatar_url FROM fb_accounts WHERE id = ?`,
+      [this.accountId],
+    ) as { avatar_url?: string } | undefined;
+    const candidates = [...new Set(threadIds.map(String))].filter(id => /^\d+$/.test(id)).filter(id => {
+      const thread = db.queryOne?.(
+        `SELECT type, metadata FROM fb_threads WHERE id = ? AND account_id = ?`,
+        [id, this.accountId],
+      ) as { type?: string; metadata?: string } | undefined;
+      if (thread?.type === 'group') return false;
+      const contact = db.queryOne?.(
+        `SELECT avatar_url FROM contacts WHERE owner_zalo_id = ? AND contact_id = ? AND channel = 'facebook'`,
+        [ownerId, id],
+      ) as { avatar_url?: string } | undefined;
+      return !contact?.avatar_url || isSameFacebookAvatar(contact.avatar_url, account?.avatar_url);
+    });
+
+    let repaired = 0;
+    let cursor = 0;
+    const worker = async () => {
+      while (cursor < candidates.length) {
+        const id = candidates[cursor++];
+        try {
+          const avatarUrl = await getFacebookAvatarById(session.cookieFacebook, id, this.httpsAgent);
+          if (!avatarUrl || isSameFacebookAvatar(avatarUrl, account?.avatar_url)) continue;
+          db.run?.(
+            `UPDATE contacts SET avatar_url = ? WHERE owner_zalo_id = ? AND contact_id = ? AND channel = 'facebook'`,
+            [avatarUrl, ownerId, id],
+          );
+          const row = db.queryOne?.(
+            `SELECT metadata FROM fb_threads WHERE id = ? AND account_id = ?`,
+            [id, this.accountId],
+          ) as { metadata?: string } | undefined;
+          let metadata: Record<string, any> = {};
+          try { metadata = row?.metadata ? JSON.parse(row.metadata) : {}; } catch {}
+          metadata.avatar_url = avatarUrl;
+          db.run?.(
+            `UPDATE fb_threads SET metadata = ? WHERE id = ? AND account_id = ?`,
+            [JSON.stringify(metadata), id, this.accountId],
+          );
+          EventBroadcaster.emit('fb:onContactUpdate', {
+            fbAccountId: ownerId,
+            contactId: id,
+            name: '',
+            avatarUrl,
+          });
+          repaired++;
+        } catch (err: any) {
+          Logger.debug(`[FacebookService:${this.accountId}] Page avatar refresh failed for ${id}: ${err.message}`);
+        }
+      }
+    };
+    await Promise.all(Array.from({ length: Math.min(3, candidates.length) }, worker));
+    if (repaired) Logger.log(`[FacebookService:${this.accountId}] Repaired ${repaired} Facebook/Page avatar(s)`);
+    return repaired;
+  }
+
+  /** Reload the bridge inbox page, including conversations absent from web GraphQL. */
+  public async syncBridgeHistory(): Promise<{ threads: number; messages: number }> {
+    if (!this.e2eeBridge?.isAlive()) return { threads: 0, messages: 0 };
+    try {
+      return this.persistBridgeHistory(await this.e2eeBridge.syncHistory());
+    } catch (err: any) {
+      Logger.warn(`[FacebookService:${this.accountId}] syncBridgeHistory error: ${err.message}`);
+      return { threads: 0, messages: 0 };
+    }
+  }
+
+  /**
    * Refresh avatar cho 1 contact Facebook (user 1-1).
    * Chiến lược 3 lớp, đảm bảo luôn lấy được avatar:
-   *   1. Scrape profile page → URL CDN fresh (không phụ thuộc cache GraphQL)
+   *   1. Endpoint profile được khóa theo UID → URL CDN fresh
    *   2. Download ảnh về local với Facebook cookie → local path không bh hết hn
    *   3. Fallback: re-fetch thread list GraphQL → URL CDN fresh
    *
@@ -2544,8 +2803,14 @@ export class FacebookService {
     const fbId = session.FacebookID;
 
     try {
-      // Bc 1: Scrape profile page ca user Facebook ly URL CDN fresh nht
-      let freshCdnUrl = await fetchUserAvatarFromProfile(cookie, fbUserId);
+      // E2EE contacts are available directly from the bridge. Prefer that
+      // task before the public image redirect, which can return 404 for some
+      // Messenger-only identities.
+      const bridgeInfo = await this.getE2EEUserInfo(fbUserId);
+      let freshCdnUrl = bridgeInfo?.avatarUrl || await getFacebookAvatarById(cookie, fbUserId, this.httpsAgent);
+      if (!freshCdnUrl) {
+        freshCdnUrl = (await getFacebookUserInfo(session, fbUserId, this.httpsAgent))?.avatarUrl || null;
+      }
 
       // Bc 2: Nu profile page khng c, th re-fetch thread list t GraphQL
       if (!freshCdnUrl) {
@@ -2612,17 +2877,57 @@ export class FacebookService {
   }
 
   /**
-   * Lấy thông tin user Facebook (tên + avatar) từ profile page HTML.
-   * Dùng cho E2EE / hội thoại mới không có contact info trong DB.
+   * Lấy thông tin user Facebook (tên + avatar) qua endpoint được khóa theo UID.
+   * Tên method cũ được giữ để không phá IPC/renderer đã phát hành.
    */
-  public async getUserInfoFacebookHtml(fbUserId: string): Promise<{ name: string; avatarUrl: string } | null> {
+  public async getUserInfoFacebook(fbUserId: string): Promise<{ name: string; avatarUrl: string } | null> {
     try {
-      const session = this.requireSession();
-      return await getUserInfoFacebookHtml(session.cookieFacebook, fbUserId);
+      return await this.resolveFacebookUserInfo(fbUserId);
     } catch (err: any) {
-      Logger.warn(`[FacebookService:${this.accountId}] getUserInfoFacebookHtml error: ${err.message}`);
+      Logger.warn(`[FacebookService:${this.accountId}] getUserInfoFacebook error: ${err.message}`);
       return null;
     }
+  }
+
+  /** Use the Messenger bridge when an E2EE session can authoritatively resolve a contact. */
+  private async getE2EEUserInfo(fbUserId: string): Promise<{ name: string; avatarUrl: string } | null> {
+    if (!/^\d+$/.test(fbUserId) || !this.isE2EEConnected() || !this.e2eeBridge?.supportsCapability('getUserInfo')) {
+      return null;
+    }
+    try {
+      const info = await this.e2eeBridge.getUserInfo(fbUserId);
+      if (String(info?.id ?? '') !== fbUserId || !String(info?.name || '').trim()) {
+        Logger.warn(`[FacebookService:${this.accountId}] Bridge user info did not match requested UID ${fbUserId}`);
+        return null;
+      }
+      return { name: info.name.trim(), avatarUrl: String(info.profilePictureUrl || '') };
+    } catch (err: any) {
+      Logger.warn(`[FacebookService:${this.accountId}] Bridge getUserInfo failed for ${fbUserId}: ${err.message}`);
+      return null;
+    }
+  }
+
+  /**
+   * Resolve an identity without reading profile HTML. Bridge data is preferred
+   * for active E2EE conversations; the UID-keyed web endpoint is a bounded
+   * fallback for normal conversations and older bridge binaries.
+   */
+  private async resolveFacebookUserInfo(fbUserId: string): Promise<{ name: string; avatarUrl: string } | null> {
+    const bridgeInfo = await this.getE2EEUserInfo(fbUserId);
+    if (bridgeInfo) return bridgeInfo;
+
+    const session = this.requireSession();
+    const profile = await getFacebookUserInfo(session, fbUserId, this.httpsAgent);
+    if (!profile) return null;
+    // /picture is addressed to the UID, but a 404 is not fatal: user_info
+    // already supplied an identity-safe thumbnail.
+    const exactAvatar = await getFacebookAvatarById(session.cookieFacebook, fbUserId, this.httpsAgent);
+    return { name: profile.name, avatarUrl: exactAvatar || profile.avatarUrl };
+  }
+
+  /** @deprecated Use getUserInfoFacebook. Kept for integrations built before the UID endpoint. */
+  public async getUserInfoFacebookHtml(fbUserId: string): Promise<{ name: string; avatarUrl: string } | null> {
+    return this.getUserInfoFacebook(fbUserId);
   }
 
   public async changeThreadName(threadId: string, name: string): Promise<boolean> {
@@ -2674,31 +2979,43 @@ export class FacebookService {
 
   /** Thêm admin nhóm (N3) */
   public async addGroupAdmin(threadId: string, userId: string): Promise<{ success: boolean; error?: string }> {
+    const allowed = await this.requireGroupOperation(threadId, 'Thêm quản trị viên');
+    if (!allowed.success) return allowed;
     return addGroupAdmin(this.requireSession(), threadId, userId);
   }
 
   /** Xóa admin nhóm (N3) */
   public async removeGroupAdmin(threadId: string, userId: string): Promise<{ success: boolean; error?: string }> {
+    const allowed = await this.requireGroupOperation(threadId, 'Xóa quản trị viên');
+    if (!allowed.success) return allowed;
     return removeGroupAdmin(this.requireSession(), threadId, userId);
   }
 
   /** Bật/tắt duyệt thành viên (N3) */
   public async changeApprovalMode(threadId: string, approved: boolean): Promise<{ success: boolean; error?: string }> {
+    const allowed = await this.requireGroupOperation(threadId, 'Đổi chế độ duyệt thành viên');
+    if (!allowed.success) return allowed;
     return changeApprovalMode(this.requireSession(), threadId, approved, this.httpsAgent);
   }
 
   /** Duyệt/từ chối thành viên (N3) */
   public async approvePendingMember(threadId: string, userId: string, approve: boolean): Promise<{ success: boolean; error?: string }> {
+    const allowed = await this.requireGroupOperation(threadId, approve ? 'Duyệt thành viên' : 'Từ chối thành viên');
+    if (!allowed.success) return allowed;
     return approvePendingMember(this.requireSession(), threadId, userId, approve, this.httpsAgent);
   }
 
   /** Lấy link mời nhóm (N3) */
   public async getGroupLink(threadId: string): Promise<{ success: boolean; link?: string; error?: string }> {
+    const allowed = await this.requireGroupOperation(threadId, 'Lấy link mời nhóm');
+    if (!allowed.success) return allowed;
     return getGroupLink(this.requireSession(), threadId, this.httpsAgent);
   }
 
   /** Bật/tắt link mời nhóm (N3) */
   public async setGroupLink(threadId: string, enable: boolean): Promise<{ success: boolean; error?: string }> {
+    const allowed = await this.requireGroupOperation(threadId, 'Đổi link mời nhóm');
+    if (!allowed.success) return allowed;
     return setGroupLink(this.requireSession(), threadId, enable, this.httpsAgent);
   }
 

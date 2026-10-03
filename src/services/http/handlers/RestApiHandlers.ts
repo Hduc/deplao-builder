@@ -760,7 +760,12 @@ export const handlers = {
     const zaloId = params.zaloId || employee.assigned_accounts[0];
     if (!zaloId) return error('Missing zaloId');
 
-    const overview = db().getDashboardOverview(zaloId);
+    const overview = db().getDashboardOverview(
+      zaloId,
+      params.sinceTs !== undefined ? Number(params.sinceTs) : undefined,
+      params.untilTs !== undefined ? Number(params.untilTs) : undefined,
+      params.threadType !== undefined ? Number(params.threadType) : undefined,
+    );
     return success(overview);
   },
 

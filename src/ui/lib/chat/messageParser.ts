@@ -25,15 +25,20 @@ export function parseTxt(content: string): string {
   } catch { return convertZaloEmojis(content); }
 }
 
-/** A native Telegram mention range, stored with the message attachments. */
-export interface TelegramMentionRange {
+/** A native mention range, stored with the message attachments. */
+export interface MentionRange {
   offset: number;
   length: number;
   userId?: string;
+  username?: string;
+  isAll?: boolean;
 }
 
-/** Read native Telegram mention entities without requiring a DB migration. */
-export function getTelegramMentionRanges(attachments: unknown): TelegramMentionRange[] {
+/** Kept as an alias while older call sites migrate to platform-neutral mentions. */
+export type TelegramMentionRange = MentionRange;
+
+/** Read native Zalo and Telegram mention entities without a DB migration. */
+export function getMentionRanges(attachments: unknown): MentionRange[] {
   let parsed = attachments;
   if (typeof parsed === 'string') {
     try { parsed = JSON.parse(parsed); } catch { return []; }
@@ -41,17 +46,28 @@ export function getTelegramMentionRanges(attachments: unknown): TelegramMentionR
   if (!Array.isArray(parsed)) return [];
 
   return parsed
-    .filter((attachment: any) => attachment?.type === 'telegram_mention')
+    .filter((attachment: any) =>
+      attachment?.type === 'telegram_mention' || attachment?.type === 'zalo_mention'
+    )
     .map((attachment: any) => ({
       offset: Number(attachment.offset),
       length: Number(attachment.length),
-      userId: attachment.user_id ? String(attachment.user_id) : undefined,
+      userId: attachment.user_id && String(attachment.user_id) !== '-1'
+        ? String(attachment.user_id)
+        : undefined,
+      username: attachment.username ? String(attachment.username).replace(/^@/, '') : undefined,
+      isAll: attachment.kind === 'all' || String(attachment.user_id || '') === '-1',
     }))
-    .filter((mention: TelegramMentionRange) =>
+    .filter((mention: MentionRange) =>
       Number.isInteger(mention.offset) && mention.offset >= 0
       && Number.isInteger(mention.length) && mention.length > 0
     )
-    .sort((a: TelegramMentionRange, b: TelegramMentionRange) => a.offset - b.offset);
+    .sort((a: MentionRange, b: MentionRange) => a.offset - b.offset);
+}
+
+/** Backwards-compatible name for callers that only render Telegram messages. */
+export function getTelegramMentionRanges(attachments: unknown): TelegramMentionRange[] {
+  return getMentionRanges(attachments);
 }
 
 /**

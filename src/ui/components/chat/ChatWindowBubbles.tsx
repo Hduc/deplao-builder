@@ -15,7 +15,7 @@ import {toLocalMediaUrl} from '@/lib/localMedia';
 import {formatPhone} from '@/utils/phoneUtils';
 import PhoneDisplay from '../common/PhoneDisplay';
 import {convertZaloEmojis} from '@/lib/chat/emojiUtils';
-import {getTelegramMentionRanges, linkifyText, type TelegramMentionRange} from '@/lib/chat/messageParser';
+import {getMentionRanges, linkifyText, type MentionRange} from '@/lib/chat/messageParser';
 import {isMediaType} from '@/lib/chat/messageTypeUtils';
 import {TgsBubble} from './MessageBubbles';
 
@@ -732,7 +732,7 @@ export function MediaBubble({msg, onView, isSent, allContacts, groupMembersList,
                     channel={msg.channel}
                     allContacts={allContacts}
                     groupMembersList={groupMembersList}
-                    mentionRanges={getTelegramMentionRanges(msg.attachments)}
+                    mentionRanges={getMentionRanges(msg.attachments)}
                     onMentionClick={onMentionClick}
                 />
             </div>
@@ -1279,7 +1279,7 @@ export function MediaGroupBubble({
                         channel={telegramCaptionMessage.channel}
                         allContacts={allContacts}
                         groupMembersList={groupMembersList}
-                        mentionRanges={getTelegramMentionRanges(telegramCaptionMessage.attachments)}
+                        mentionRanges={getMentionRanges(telegramCaptionMessage.attachments)}
                         onMentionClick={onMentionClick}
                     />
                 </div>
@@ -1471,7 +1471,7 @@ export function SingleImageInGroup({msg, onView, isSent, isSelecting: isSelectin
                             channel={msg.channel}
                             allContacts={allContacts}
                             groupMembersList={groupMembersList}
-                            mentionRanges={getTelegramMentionRanges(msg.attachments)}
+                            mentionRanges={getMentionRanges(msg.attachments)}
                             onMentionClick={onMentionClick}
                         />
                     </div>
@@ -1950,10 +1950,12 @@ export function EcardBubble({msg, onManage}: { msg: any; onManage?: () => void }
     );
 }
 
-export function CardBubble({msg, isSent, onOpenProfile}: {
+export function CardBubble({msg, isSent, onOpenProfile, allContacts, groupMembersList}: {
     msg: any;
     isSent: boolean;
-    onOpenProfile?: (userId: string, e: React.MouseEvent) => void
+    onOpenProfile?: (userId: string, e: React.MouseEvent) => void;
+    allContacts?: any[];
+    groupMembersList?: any[];
 }) {
     let parsed: any = {};
     try {
@@ -1961,7 +1963,17 @@ export function CardBubble({msg, isSent, onOpenProfile}: {
     } catch {
     }
     const action = String(parsed.action || '');
-    if (action === 'recommened.link') return <LinkBubble parsed={parsed} isSent={isSent}/>;
+    if (action === 'recommened.link' || action === 'recommended.link') {
+        return <LinkBubble
+            parsed={parsed}
+            isSent={isSent}
+            channel={msg.channel}
+            allContacts={allContacts}
+            groupMembersList={groupMembersList}
+            mentionRanges={getMentionRanges(msg.attachments)}
+            onMentionClick={onOpenProfile}
+        />;
+    }
     // recommened.calltime = cuộc gọi có thời gian, recommened.misscall = cuộc gọi nhỡ
     if (action === 'recommened.calltime' || action === 'recommened.misscall') return <CallBubble parsed={parsed}
                                                                                                  isSent={isSent}/>;
@@ -1969,7 +1981,17 @@ export function CardBubble({msg, isSent, onOpenProfile}: {
 }
 
 // ─── LinkBubble - hiển thị tin nhắn link preview như Zalo ────────────────────
-export function LinkBubble({parsed, isSent}: { parsed: any; isSent: boolean }) {
+export function LinkBubble({
+    parsed, isSent, channel, allContacts, groupMembersList, mentionRanges, onMentionClick,
+}: {
+    parsed: any;
+    isSent: boolean;
+    channel?: string;
+    allContacts?: any[];
+    groupMembersList?: any[];
+    mentionRanges?: MentionRange[];
+    onMentionClick?: (userId: string, e: React.MouseEvent) => void;
+}) {
     const href = String(parsed.href || parsed.title || '');
     const params = (() => {
         try {
@@ -2025,7 +2047,16 @@ export function LinkBubble({parsed, isSent}: { parsed: any; isSent: boolean }) {
             <div className="px-3 py-2.5 space-y-1.5 select-text cursor-text">
                 {displayTitle && (
                     <p className="text-sm text-white leading-snug">
-                        {displayTitle}
+                        <TextWithMentions
+                            text={displayTitle}
+                            channel={channel}
+                            allContacts={allContacts}
+                            groupMembersList={groupMembersList}
+                            mentionRanges={(mentionRanges || []).filter((range) =>
+                                range.offset + range.length <= displayTitle.length
+                            )}
+                            onMentionClick={onMentionClick}
+                        />
                     </p>
                 )}
 
@@ -2473,7 +2504,7 @@ export function TextWithMentions({
     channel?: string;
     allContacts?: any[];
     groupMembersList?: any[];
-    mentionRanges?: TelegramMentionRange[];
+    mentionRanges?: MentionRange[];
     onMentionClick?: (userId: string, e: React.MouseEvent) => void;
     highlight?: string;
 }) {
@@ -2507,15 +2538,13 @@ export function TextWithMentions({
         return parts.length ? <React.Fragment key={key}>{parts}</React.Fragment> : <span key={key}>{linkifyText(str, {detectMentions})}</span>;
     };
 
-    // Telegram gives the exact UTF-16 ranges for real mentions. They are
+    // Platforms give exact UTF-16 ranges for real mentions. They are
     // authoritative: when present, do not infer further mentions from raw @.
-    const nativeMentionRanges = isTelegram(channel)
-        ? (mentionRanges || []).filter((range) =>
+    const nativeMentionRanges = (mentionRanges || []).filter((range) =>
             range.offset >= 0
             && range.length > 0
             && range.offset + range.length <= converted.length
-        )
-        : [];
+        );
     if (nativeMentionRanges.length > 0) {
         const segments: React.ReactNode[] = [];
         let cursor = 0;
@@ -2526,14 +2555,31 @@ export function TextWithMentions({
             }
             const mentionText = converted.slice(range.offset, range.offset + range.length);
             const userId = range.userId || '';
+            // Older rows stored the range before we persisted the username.
+            // The visible @token still lets us resolve those historical rows.
+            const username = range.username || (mentionText.startsWith('@') ? mentionText.slice(1) : '');
+            const canResolveUsername = !!username && isTelegramUser(channel) && !range.isAll;
+            const canClick = !!onMentionClick && !range.isAll && (!!userId || canResolveUsername);
             segments.push(
                 <span
                     key={`native-mention-${range.offset}`}
-                    className={`font-semibold${userId && onMentionClick ? ' cursor-pointer hover:underline' : ''}`}
+                    className={`font-semibold${canClick ? ' cursor-pointer hover:underline' : ''}`}
                     style={{color: '#5398f3'}}
-                    onClick={userId && onMentionClick ? (e) => {
+                    title={range.isAll ? 'Thông báo tất cả thành viên' : undefined}
+                    onClick={canClick ? async (e) => {
                         e.stopPropagation();
-                        onMentionClick(userId, e);
+                        if (!onMentionClick) return;
+                        if (userId) {
+                            onMentionClick(userId, e);
+                            return;
+                        }
+                        try {
+                            const accountId = useAccountStore.getState().activeAccountId || '';
+                            const resolved = await ipc.telegramUser?.resolveUsername?.({ accountId, username });
+                            if (resolved?.success && resolved.peer?.peerId) onMentionClick(String(resolved.peer.peerId), e);
+                        } catch {
+                            // A username may be private or no longer available.
+                        }
                     } : undefined}
                 >{mentionText}</span>
             );
@@ -2589,7 +2635,8 @@ export function TextWithMentions({
                 const expectedUsername = username ? '@' + username : '';
                 const matchedExpected = [expectedName, expectedUsername].find((candidate) =>
                     candidate
-                    && converted.startsWith(candidate, atIdx)
+                    && converted.slice(atIdx, atIdx + candidate.length).toLocaleLowerCase()
+                        === candidate.toLocaleLowerCase()
                     && !/[a-zA-Z0-9_]/.test(converted[atIdx + candidate.length] || '')
                 ) || '';
                 if (matchedExpected) {
@@ -2620,22 +2667,19 @@ export function TextWithMentions({
             const mentionText = usernameMatch?.[0] || '@';
             const end = atIdx + mentionText.length;
             const username = mentionText.slice(1); // strip @
+            const canResolveUsername = isTelegramUser(channel) && !!onMentionClick;
             segments.push(
-                <span key={atIdx} className="font-semibold cursor-pointer hover:underline"
+                <span key={atIdx} className={`font-semibold${canResolveUsername ? ' cursor-pointer hover:underline' : ''}`}
                     style={{color: '#79b4fd'}}
-                    onClick={async (e) => {
+                    onClick={canResolveUsername ? async (e) => {
                         e.stopPropagation();
                         if (!onMentionClick) return;
-                        // Resolve username → peerId từ DB (telegram_peers table)
                         try {
                             const accId = useAccountStore.getState().activeAccountId || '';
-                            const peersRes = await ipc.telegramUser?.getPeers?.({ accountId: accId });
-                            const peer = peersRes?.peers?.find((p: any) => p.username === username);
-                            onMentionClick(peer?.peer_id || username, e);
-                        } catch {
-                            onMentionClick(username, e);
-                        }
-                    }}
+                            const resolved = await ipc.telegramUser?.resolveUsername?.({ accountId: accId, username });
+                            if (resolved?.success && resolved.peer?.peerId) onMentionClick(String(resolved.peer.peerId), e);
+                        } catch {}
+                    } : undefined}
                 >{mentionText}</span>
             );
             i = end;

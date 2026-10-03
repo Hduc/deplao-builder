@@ -18,6 +18,18 @@ class FacebookConnectionManager {
     if (this.connections.has(accountId)) {
       const existing = this.connections.get(accountId)!;
       if (proxyId !== undefined) existing.setProxy(proxyId);
+      // The status flag can remain `connected` after MQTT has gone away. Always
+      // drive a reused instance through its real transport check; callers must
+      // never receive a stale service that only becomes usable after a manual
+      // dashboard reconnect.
+      try {
+        const ready = await existing.ensureConnected();
+        if (!ready) {
+          Logger.warn(`[FacebookConnectionManager] transport not ready for ${accountId}`);
+        }
+      } catch (err: any) {
+        Logger.warn(`[FacebookConnectionManager] ensureConnected failed for ${accountId}: ${err?.message || err}`);
+      }
       return existing;
     }
     const service = await FacebookService.getInstance(accountId, cookie, proxyId);

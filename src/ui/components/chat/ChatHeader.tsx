@@ -186,7 +186,7 @@ export default function ChatHeader() {
       fetchContactInfo(activeAccountId, activeThreadId).catch(() => {});
     } else if (isFacebook(channel)) {
       // Facebook: lấy tên + avatar từ HTML profile
-      ipc.fb?.getUserInfoFacebookHtml({ accountId: activeAccountId, userId: activeThreadId })
+      ipc.fb?.getUserInfoFacebook({ accountId: activeAccountId, userId: activeThreadId })
         .then((res: any) => {
           if (res?.success && (res.name || res.avatarUrl)) {
             const patch: any = { contact_id: activeThreadId, channel: 'facebook' };
@@ -441,10 +441,18 @@ export default function ChatHeader() {
     setTgDownloading(true);
     showNotification(`Đang tải ${limit} tin nhắn từ Telegram...`, 'info');
     try {
-      const res = await ipc.telegramUser?.getMessages({ accountId: activeAccountId, chatId: activeThreadId, limit });
-      if (res?.success && res.messages?.length) {
-        // Reload messages from DB into store so they appear in UI
-        const dbRes = await DataAccessor.getMessages({ zaloId: activeAccountId, threadId: activeThreadId, limit: limit + 20, offset: 0 });
+      const res = await ipc.telegramUser?.getMessages({
+        accountId: activeAccountId,
+        chatId: activeThreadId,
+        limit,
+        // The importer persists messages in the main process. Do not copy the
+        // complete imported history through IPC just to show the newest page.
+        returnMessages: false,
+      });
+      const downloadedCount = Number(res?.count || 0);
+      if (res?.success && downloadedCount > 0) {
+        // Keep the renderer bounded even when the user imports thousands of rows.
+        const dbRes = await DataAccessor.getMessages({ zaloId: activeAccountId, threadId: activeThreadId, limit: 200, offset: 0 });
         if (dbRes?.messages?.length) {
           useChatStore.getState().setMessages(activeAccountId, activeThreadId, [...dbRes.messages].reverse());
 
@@ -460,7 +468,7 @@ export default function ChatHeader() {
             });
           }
         }
-        showNotification(`Đã tải ${res.messages.length} tin nhắn`, 'success');
+        showNotification(`Đã tải ${downloadedCount} tin nhắn`, 'success');
       } else {
         // Skip noisy Telegram errors — CHANNEL_PRIVATE is expected for restricted channels
         const err = res?.error || '';
@@ -520,7 +528,7 @@ export default function ChatHeader() {
         }
       } else {
         // Facebook: refresh tên + avatar từ profile HTML
-        const fbRes = await ipc.fb?.getUserInfoFacebookHtml({ accountId: activeAccountId, userId: activeThreadId });
+        const fbRes = await ipc.fb?.getUserInfoFacebook({ accountId: activeAccountId, userId: activeThreadId });
         if (fbRes?.success && (fbRes.name || fbRes.avatarUrl)) {
           const patch: any = { contact_id: activeThreadId };
           if (fbRes.name) patch.display_name = fbRes.name;
@@ -579,7 +587,7 @@ export default function ChatHeader() {
     if (!acc || (acc.channel || CHANNEL.ZALO) !== 'facebook') return;
     setRefreshingFBInfo(true);
     try {
-      const res = await ipc.fb?.getUserInfoFacebookHtml({ accountId: activeAccountId, userId: activeThreadId });
+      const res = await ipc.fb?.getUserInfoFacebook({ accountId: activeAccountId, userId: activeThreadId });
       if (res?.success && (res.name || res.avatarUrl)) {
         const patch: any = { contact_id: activeThreadId };
         if (res.name) patch.display_name = res.name;

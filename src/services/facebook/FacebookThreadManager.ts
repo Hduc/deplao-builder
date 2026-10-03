@@ -9,6 +9,7 @@ import {
   FBSessionData, FBThread, FBThreadDataResult, FBMessageRequest
 } from './FacebookTypes';
 import { buildFormData, buildPostConfig, parseFBResponse, rateLimitDelay } from './FacebookUtils';
+import { assertFacebookMutationSuccess, parseFacebookResponse } from './FacebookGraphQLResult';
 import Logger from '../../utils/Logger';
 
 const GRAPHQL_BATCH_URL = 'https://www.facebook.com/api/graphqlbatch/';
@@ -109,7 +110,13 @@ export function parseThreadNodes(dataGet: string, accountId: string, fbUserId?: 
       const threadId = node?.thread_key?.thread_fbid || node?.thread_key?.other_user_id;
       const isGroup = !!node?.thread_key?.thread_fbid;
       const participants = node?.all_participants?.edges || [];
-      const selfId = fbUserId || accountId;
+      const selfId = String(fbUserId || accountId);
+      const actorId = (edge: any) => String(edge?.node?.messaging_actor?.id || '');
+      const actorAvatar = (actor: any) => actor?.big_image_src?.uri
+        || actor?.profile_picture?.uri
+        || actor?.profile_picture_url
+        || actor?.image?.uri
+        || '';
 
       let threadName = node.name || '';
       let avatarUrl = '';
@@ -119,7 +126,7 @@ export function parseThreadNodes(dataGet: string, accountId: string, fbUserId?: 
         if (!threadName) {
           const otherNames = participants
             .map((e: any) => e?.node?.messaging_actor)
-            .filter((a: any) => a?.id && a.id !== selfId)
+            .filter((a: any) => a?.id && String(a.id) !== selfId)
             .map((a: any) => a?.name || '')
             .filter(Boolean)
             .slice(0, 4);
@@ -128,25 +135,34 @@ export function parseThreadNodes(dataGet: string, accountId: string, fbUserId?: 
         // Group avatar: use thread image_src if available, else first participant avatar
         avatarUrl = node?.image?.uri || '';
         if (!avatarUrl && participants.length > 0) {
-          const firstOther = participants.find((e: any) => e?.node?.messaging_actor?.id !== selfId);
-          avatarUrl = firstOther?.node?.messaging_actor?.big_image_src?.uri
-            || firstOther?.node?.messaging_actor?.profile_picture?.uri || '';
+          const firstOther = participants.find((e: any) => actorId(e) && actorId(e) !== selfId);
+          avatarUrl = actorAvatar(firstOther?.node?.messaging_actor);
         }
       } else {
         // 1:1: extract name + avatar from the other participant
-        const otherUser = node?.thread_key?.other_user_id;
+        const otherUser = String(node?.thread_key?.other_user_id || '');
         const other = participants.find((e: any) => {
-          const id = e?.node?.messaging_actor?.id;
+          const id = actorId(e);
           return id && id === otherUser && id !== selfId;
         }) || participants.find((e: any) => {
-          const id = e?.node?.messaging_actor?.id;
+          const id = actorId(e);
           return id && id !== selfId;
-        }) || participants[0];
+        });
         const actor = other?.node?.messaging_actor;
-        threadName = actor?.name || '';
-        avatarUrl = actor?.big_image_src?.uri || actor?.profile_picture?.uri || '';
+        threadName = actor?.name || node?.name || '';
+        // The thread image is Facebook's canonical image for a Page thread;
+        // keep it as fallback when participant data is partial.
+        avatarUrl = actorAvatar(actor) || node?.image?.uri || '';
       }
       if (!threadName) threadName = 'Khng c tn';
+      // The persisted inbox query returns this as `unread_count` on current
+      // Messenger responses. Keep the camelCase fallback for older payloads;
+      // a missing field deliberately remains zero rather than reusing a stale
+      // local badge from a previous process start.
+      const rawUnreadCount = Number(node?.unread_count ?? node?.unreadCount ?? 0);
+      const unreadCount = Number.isFinite(rawUnreadCount) && rawUnreadCount > 0
+        ? Math.floor(rawUnreadCount)
+        : 0;
 
       return {
         id: String(threadId || ''),
@@ -159,7 +175,7 @@ export function parseThreadNodes(dataGet: string, accountId: string, fbUserId?: 
         last_message_at: node?.updated_time_precise
           ? Math.floor(parseInt(node.updated_time_precise) / 1000)
           : undefined,
-        unread_count: 0,
+        unread_count: unreadCount,
         is_muted: false,
         metadata: avatarUrl ? { avatar_url: avatarUrl } : undefined,
       } as FBThread;
@@ -235,7 +251,7 @@ export async function changeThreadName(
 
   try {
     const formBody = new URLSearchParams(form).toString();
-    await axios.post(GRAPHQL_URL, formBody, {
+    const response = await axios.post(GRAPHQL_URL, formBody, {
       headers: {
         'Content-Type': 'application/x-www-form-urlencoded',
         'Cookie': dataFB.cookieFacebook,
@@ -245,6 +261,7 @@ export async function changeThreadName(
       },
       timeout: 15000,
     });
+    assertFacebookMutationSuccess('changeThreadName', parseFacebookResponse(response.data as string));
     return true;
   } catch (err: any) {
     Logger.error(`[FacebookThreadManager] changeThreadName error: ${err.message}`);
@@ -270,7 +287,7 @@ export async function changeThreadEmoji(
 
   try {
     const formBody = new URLSearchParams(form).toString();
-    await axios.post(GRAPHQL_URL, formBody, {
+    const response = await axios.post(GRAPHQL_URL, formBody, {
       headers: {
         'Content-Type': 'application/x-www-form-urlencoded',
         'Cookie': dataFB.cookieFacebook,
@@ -280,6 +297,7 @@ export async function changeThreadEmoji(
       },
       timeout: 15000,
     });
+    assertFacebookMutationSuccess('changeThreadEmoji', parseFacebookResponse(response.data as string));
     return true;
   } catch (err: any) {
     Logger.error(`[FacebookThreadManager] changeThreadEmoji error: ${err.message}`);
@@ -308,7 +326,7 @@ export async function changeNickname(
 
   try {
     const formBody = new URLSearchParams(form).toString();
-    await axios.post(GRAPHQL_URL, formBody, {
+    const response = await axios.post(GRAPHQL_URL, formBody, {
       headers: {
         'Content-Type': 'application/x-www-form-urlencoded',
         'Cookie': dataFB.cookieFacebook,
@@ -318,6 +336,7 @@ export async function changeNickname(
       },
       timeout: 15000,
     });
+    assertFacebookMutationSuccess('changeNickname', parseFacebookResponse(response.data as string));
     return true;
   } catch (err: any) {
     Logger.error(`[FacebookThreadManager] changeNickname error: ${err.message}`);
@@ -489,7 +508,7 @@ async function changeGroupAdminStatus(
 
   try {
     const formBody = new URLSearchParams(form).toString();
-    await axios.post(GRAPHQL_URL, formBody, {
+    const response = await axios.post(GRAPHQL_URL, formBody, {
       headers: {
         'Host': 'www.facebook.com',
         'Content-Type': 'application/x-www-form-urlencoded',
@@ -500,6 +519,7 @@ async function changeGroupAdminStatus(
       },
       timeout: 30000,
     });
+    assertFacebookMutationSuccess(add ? 'addGroupAdmin' : 'removeGroupAdmin', parseFacebookResponse(response.data as string));
     return { success: true };
   } catch (err: any) {
     Logger.error(`[FacebookThreadManager] changeGroupAdmin error: ${err.message}`);
@@ -536,7 +556,7 @@ export async function changeApprovalMode(
 
   try {
     const formBody = new URLSearchParams(form).toString();
-    await axios.post(GRAPHQL_URL, formBody, {
+    const response = await axios.post(GRAPHQL_URL, formBody, {
       headers: {
         'Host': 'www.facebook.com',
         'Content-Type': 'application/x-www-form-urlencoded',
@@ -547,6 +567,7 @@ export async function changeApprovalMode(
       },
       timeout: 30000,
     });
+    assertFacebookMutationSuccess('changeApprovalMode', parseFacebookResponse(response.data as string));
     return { success: true };
   } catch (err: any) {
     Logger.error(`[FacebookThreadManager] changeApprovalMode error: ${err.message}`);
@@ -583,7 +604,7 @@ export async function approvePendingMember(
 
   try {
     const formBody = new URLSearchParams(form).toString();
-    await axios.post(GRAPHQL_URL, formBody, {
+    const response = await axios.post(GRAPHQL_URL, formBody, {
       headers: {
         'Host': 'www.facebook.com',
         'Content-Type': 'application/x-www-form-urlencoded',
@@ -594,6 +615,7 @@ export async function approvePendingMember(
       },
       timeout: 30000,
     });
+    assertFacebookMutationSuccess('approvePendingMember', parseFacebookResponse(response.data as string));
     return { success: true };
   } catch (err: any) {
     Logger.error(`[FacebookThreadManager] approvePendingMember error: ${err.message}`);
@@ -638,7 +660,8 @@ export async function getGroupLink(
       timeout: 30000,
     });
 
-    const parsed = parseFBResponse(response.data as string);
+    const parsed = parseFacebookResponse(response.data as string);
+    assertFacebookMutationSuccess('getGroupLink', parsed);
     const link = parsed?.data?.node?.group?.group_invite_link?.url
       || parsed?.data?.group?.invite_link;
     return { success: true, link: link ? String(link) : undefined };
@@ -676,7 +699,7 @@ export async function setGroupLink(
 
   try {
     const formBody = new URLSearchParams(form).toString();
-    await axios.post(GRAPHQL_URL, formBody, {
+    const response = await axios.post(GRAPHQL_URL, formBody, {
       headers: {
         'Host': 'www.facebook.com',
         'Content-Type': 'application/x-www-form-urlencoded',
@@ -687,6 +710,7 @@ export async function setGroupLink(
       },
       timeout: 30000,
     });
+    assertFacebookMutationSuccess('setGroupLink', parseFacebookResponse(response.data as string));
     return { success: true };
   } catch (err: any) {
     Logger.error(`[FacebookThreadManager] setGroupLink error: ${err.message}`);

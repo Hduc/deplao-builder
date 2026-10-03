@@ -199,6 +199,8 @@ if (!gotLock) {
 let mainWindow: BrowserWindow | null = null;
 let inAppBrowserWindow: BrowserWindow | null = null;
 let tray: Tray | null = null;
+let rendererReportedReady = false;
+let onRendererReportedReady: (() => void) | null = null;
 
 // In development the renderer is served by Vite. Windows can suspend the
 // localhost socket while the laptop is asleep, leaving the main process alive
@@ -282,12 +284,30 @@ function createWindow() {
     mainWindow.webContents.on('context-menu', (e) => e.preventDefault());
   }
 
+  let initialWindowShown = false;
   mainWindow.once('ready-to-show', () => {
+    initialWindowShown = true;
     if (cachedNormalIcon && !cachedNormalIcon.isEmpty()) {
       mainWindow?.setIcon(cachedNormalIcon);
     }
     mainWindow?.show();
   });
+
+  // Vite can take longer than Chromium's normal paint deadline after a cold
+  // start. Do not show an unpainted Chromium surface forever: the old fallback
+  // only called show(), which is exactly the blank blue screen users saw after
+  // Electron's network service restarted.
+  setTimeout(() => {
+    if (!initialWindowShown && mainWindow && !mainWindow.isDestroyed()) {
+      console.warn('[main] Renderer did not emit ready-to-show in time; recovering renderer');
+      mainWindow.show();
+      if (isDev) {
+        loadDevRenderer('ready-to-show timeout', 250);
+      } else {
+        mainWindow.webContents.reload();
+      }
+    }
+  }, 8_000).unref();
 
   // A successful full page load means Vite is reachable again. Reset the
   // bounded retry budget so a later laptop suspend can recover independently.
@@ -1096,18 +1116,25 @@ app.whenReady().then(async () => {
   // Initialize database
   await DatabaseService.getInstance().initialize();
 
-  // ── Migrate absolute local_paths → relative (runs once in background) ─────
-  setTimeout(() => {
-    try {
-      const migrated = DatabaseService.getInstance().migrateAllAbsolutePathsToRelative();
-      if (migrated > 0) {
-        DatabaseService.getInstance().forceFlush();
-        console.log(`[main] Startup migration: converted ${migrated} message(s) to relative paths`);
+  // ── Migrate absolute local_paths → relative ──────────────────────────────
+  // Defer this compatibility work until the renderer has had time to paint.
+  // DatabaseService records completion, so it never scans the message table on
+  // every app launch again.
+  let startupPathMigrationScheduled = false;
+  const runStartupPathMigration = () => {
+    if (startupPathMigrationScheduled) return;
+    startupPathMigrationScheduled = true;
+    setTimeout(() => {
+      try {
+        const migrated = DatabaseService.getInstance().migrateAllAbsolutePathsToRelative();
+        if (migrated > 0) {
+          console.log(`[main] Startup migration: converted ${migrated} message(s) to relative paths`);
+        }
+      } catch (e: any) {
+        console.warn(`[main] Startup path migration failed: ${e.message}`);
       }
-    } catch (e: any) {
-      console.warn(`[main] Startup path migration failed: ${e.message}`);
-    }
-  }, 2000);
+    }, 30_000).unref();
+  };
 
   // ── Anti-debug: kiểm tra debugger attach (chỉ production/staging) ──────────
   if (!isDev) {
@@ -1143,6 +1170,17 @@ app.whenReady().then(async () => {
   createTray();
   registerWindowControls();
 
+  // `ready-to-show` is a Chromium paint signal, not proof that React has
+  // mounted. Start network recovery only after the renderer itself reports a
+  // committed frame, otherwise a slow cold Vite load competes with Telegram,
+  // Zalo and Facebook recovery on the main process.
+  ipcMain.on('app:rendererReady', (event) => {
+    if (event.sender !== mainWindow?.webContents) return;
+    rendererReportedReady = true;
+    console.log('[main] Renderer app mounted');
+    onRendererReportedReady?.();
+  });
+
   // ── Handle deep link từ initial launch (first instance) ──────────
   // Khi click deplao:// link lần đầu:
   //   - Production đúng: URL nằm ở process.argv[1] hoặc sau dấu `--`
@@ -1176,20 +1214,43 @@ app.whenReady().then(async () => {
   registerErpHrmIpc();
   registerLockScreenIpc();
   registerLibraryIpc();
-  // Auto-reconnect Facebook accounts - start ngay, không đợi 4s
-  reconnectAllFBAccounts().catch(err => {
-    console.error('[main] reconnectAllFBAccounts error:', err.message);
-  });
-  // Auto-reconnect Telegram accounts - start ngay, không đợi 4s
-  reconnectAllTelegramAccounts().catch(err => {
-    console.error('[main] reconnectAllTelegramAccounts error:', err.message);
-  });
-  // Start periodic health check for Telegram bots (every 60s)
-  startTelegramBotHealthCheck();
-  // Ordered startup: relay + Zalo for all local workspaces FIRST, then remote workspaces
-  setTimeout(() => startupAllWorkspaces().catch(err => {
-    console.error('[main] startupAllWorkspaces error:', err.message);
-  }), 3000);
+  // Show the renderer before starting network listeners. At startup this account
+  // can have a large Telegram recovery queue and a Zalo WebSocket login; doing
+  // both while Chromium is still loading leaves the window hidden and makes the
+  // app appear stuck even though the main process is busy.
+  let connectorStartupStarted = false;
+  const startConnectorServices = () => {
+    if (connectorStartupStarted) return;
+    connectorStartupStarted = true;
+    console.log('[main] Renderer visible; starting channel connectors');
+
+    reconnectAllFBAccounts().catch(err => {
+      console.error('[main] reconnectAllFBAccounts error:', err.message);
+    });
+    reconnectAllTelegramAccounts().catch(err => {
+      console.error('[main] reconnectAllTelegramAccounts error:', err.message);
+    });
+    startTelegramBotHealthCheck();
+    // Ordered startup: relay + Zalo for local workspaces, then remote workspaces.
+    setTimeout(() => startupAllWorkspaces().catch(err => {
+      console.error('[main] startupAllWorkspaces error:', err.message);
+    }), 500);
+  };
+  onRendererReportedReady = () => {
+    startConnectorServices();
+    runStartupPathMigration();
+  };
+  if (rendererReportedReady) onRendererReportedReady();
+  // Keep a late fallback for a broken renderer, but give the renderer enough
+  // time to recover first. Starting all listeners at 8 seconds kept a blank
+  // window busy with recovery work and obscured the actual renderer failure.
+  setTimeout(() => {
+    if (!connectorStartupStarted) {
+      console.warn('[main] Connector startup fallback: renderer did not report ready');
+      startConnectorServices();
+      runStartupPathMigration();
+    }
+  }, 30_000).unref();
   // Resume any active CRM campaigns after restart
   setTimeout(() => CRMQueueService.getInstance().resumeActiveCampaigns(), 3000);
   // Initialize ERP Calendar reminders scheduler

@@ -170,7 +170,7 @@ declare global {
         getMessages: (params: any) => Promise<any>;
         getMessagesAround: (params: { zaloId: string; threadId: string; timestamp: number; limit?: number }) => Promise<any>;
         getContacts: (zaloId: string) => Promise<any>;
-        getContactsFiltered: (params: { zaloId: string; channel?: string; search?: string; othersOnly?: boolean; excludeOthers?: boolean; unreadOnly?: boolean; limit?: number }) => Promise<{ success: boolean; contacts: any[] }>;
+        getContactsFiltered: (params: { zaloId: string; channel?: string; search?: string; othersOnly?: boolean; excludeOthers?: boolean; unreadOnly?: boolean; limit?: number; offset?: number }) => Promise<{ success: boolean; contacts: any[] }>;
         saveAccount: (account: any) => Promise<{ success: boolean; error?: string }>;
         searchContactByPhone: (params: { zaloId: string; phone: string }) => Promise<{ success: boolean; contact: any | null }>;
         searchMessages: (params: any) => Promise<any>;
@@ -284,7 +284,7 @@ declare global {
         getActivityStats: (params: { zaloId: string; sinceTs: number; untilTs?: number; }) => Promise<{ success: boolean; conversationCount: number; messageCount: number; sentCount: number; receivedCount: number }>;
       };
       analytics: {
-        dashboardOverview: (params: { zaloId: string }) => Promise<{
+        dashboardOverview: (params: { zaloId: string; sinceTs?: number; untilTs?: number; threadType?: number }) => Promise<{
           success: boolean; totalMessages: number; totalSent: number; totalReceived: number;
           totalContacts: number; totalFriends: number; totalGroups: number;
           todayMessages: number; todaySent: number; todayReceived: number;
@@ -361,6 +361,7 @@ declare global {
       };
       app: {
         setBadge: (count: number) => void;
+        rendererReady: () => void;
         openThread: (params: { zaloId: string; threadId: string; threadType: number }) => void;
         sendBadgeImage: (params: { dataUrl: string; count: number }) => void;
         flashFrame: (active: boolean) => void;
@@ -550,6 +551,23 @@ declare global {
         forwardMessage:       (params: { accountId: string; messageId: string; targetThreadId: string; isGroup?: boolean }) => Promise<{ success: boolean; error?: string }>;
         editMessage:          (params: { accountId: string; messageId: string; text: string }) => Promise<{ success: boolean; error?: string }>;
         createPoll:           (params: { accountId: string; threadId: string; question: string; options: string[] }) => Promise<{ success: boolean; pollId?: string; error?: string }>;
+        votePoll:             (params: { accountId: string; pollId: string; optionIds: string[] }) => Promise<{ success: boolean; error?: string }>;
+        pinMessage:           (params: { accountId: string; messageId: string; threadId: string }) => Promise<{ success: boolean; error?: string }>;
+        unpinMessage:         (params: { accountId: string; messageId: string; threadId: string }) => Promise<{ success: boolean; error?: string }>;
+        sendE2EEMessage:      (params: { accountId: string; chatJid: string; text: string; replyToId?: string; replyToSenderJid?: string }) => Promise<{ success: boolean; messageId?: string; error?: string }>;
+        getE2EEStatus:        (params: { accountId: string }) => Promise<{ success: boolean; status?: string; connected?: boolean; available?: boolean; error?: string }>;
+        toggleE2EE:           (params: { accountId: string; enable: boolean }) => Promise<{ success: boolean; error?: string }>;
+        sendSeen:             (params: { accountId: string; threadId: string }) => Promise<{ success: boolean; error?: string }>;
+        changeThreadTheme:    (params: { accountId: string; threadId: string; theme: string }) => Promise<{ success: boolean; error?: string }>;
+        createNote:           (params: { accountId: string; text: string; backgroundColor?: string; textColor?: string }) => Promise<{ success: boolean; noteId?: string; error?: string }>;
+        addGroupAdmin:        (params: { accountId: string; threadId: string; userId: string }) => Promise<{ success: boolean; error?: string }>;
+        removeGroupAdmin:     (params: { accountId: string; threadId: string; userId: string }) => Promise<{ success: boolean; error?: string }>;
+        changeApprovalMode:   (params: { accountId: string; threadId: string; approved: boolean }) => Promise<{ success: boolean; error?: string }>;
+        approvePendingMember: (params: { accountId: string; threadId: string; userId: string; approve: boolean }) => Promise<{ success: boolean; error?: string }>;
+        getGroupLink:         (params: { accountId: string; threadId: string }) => Promise<{ success: boolean; link?: string; error?: string }>;
+        setGroupLink:         (params: { accountId: string; threadId: string; enable: boolean }) => Promise<{ success: boolean; error?: string }>;
+        getUserInfoFacebook: (params: { accountId: string; userId: string }) => Promise<{ success: boolean; name?: string; avatarUrl?: string; error?: string }>;
+        /** @deprecated Compatibility alias for renderer bundles before the IPC rename. */
         getUserInfoFacebookHtml: (params: { accountId: string; userId: string }) => Promise<{ success: boolean; name?: string; avatarUrl?: string; error?: string }>;
         // ─── Scan Data ────────────────────────────────────────────────
         scanGroupMembers:     (params: { accountId: string; groupId: string; cursor?: string | null }) => Promise<{ success: boolean; items: any[]; pageInfo: { endCursor: string | null; hasNextPage: boolean }; error?: string }>;
@@ -584,7 +602,7 @@ declare global {
         startBot:       (account: { accountId: string; botToken: string; botUsername: string; botFirstName: string }) => Promise<{ success: boolean; error?: string }>;
         stopBot:        (accountId: string) => Promise<{ success: boolean; error?: string }>;
         isBotPolling:   (params: { accountId: string }) => Promise<{ success: boolean; polling: boolean }>;
-        sendMessage:    (params: { accountId: string; chatId: string; text: string; parseMode?: string; replyMarkup?: Record<string, any> }) => Promise<{ success: boolean; messageId?: string; error?: string }>;
+        sendMessage:    (params: { accountId: string; chatId: string; text: string; parseMode?: string; replyMarkup?: Record<string, any>; mentions?: Array<{ uid: string; pos: number; len: number }> }) => Promise<{ success: boolean; messageId?: string; error?: string }>;
         sendPhoto:      (params: { accountId: string; chatId: string; photoPath: string; caption?: string }) => Promise<{ success: boolean; messageId?: string; error?: string }>;
         sendVideo:      (params: { accountId: string; chatId: string; videoPath: string; caption?: string }) => Promise<{ success: boolean; messageId?: string; error?: string }>;
         sendDocument:   (params: { accountId: string; chatId: string; filePath: string; caption?: string }) => Promise<{ success: boolean; messageId?: string; error?: string }>;
@@ -644,7 +662,7 @@ declare global {
         exportChatInvite:  (params: { accountId: string; chatId: string }) => Promise<{ success: boolean; link?: string; error?: string }>;
         readChatHistory:   (params: { accountId: string; chatId: string }) => Promise<{ success: boolean; error?: string }>;
         readForumTopic:    (params: { accountId: string; chatId: string; topMsgId: string; readMaxId?: string }) => Promise<{ success: boolean; error?: string }>;
-        getMessages:       (params: { accountId: string; chatId: string; limit?: number; offsetId?: number; topicRootMessageId?: string }) => Promise<{ success: boolean; messages?: any[]; error?: string }>;
+        getMessages:       (params: { accountId: string; chatId: string; limit?: number; offsetId?: number; topicRootMessageId?: string; returnMessages?: boolean }) => Promise<{ success: boolean; messages?: any[]; count?: number; error?: string }>;
         repairMessageMedia:(params: { accountId: string; chatId: string; messageId: string }) => Promise<{ success: boolean; localPaths?: Record<string, string>; attachments?: any[]; msgType?: string; error?: string }>;
         repairEmptyMessages:(params: { accountId: string; chatId: string; messageIds: string[] }) => Promise<{ success: boolean; results?: Array<{ messageId: string; resolved: boolean; content: string; msgType: string; attachments: any[]; mediaClass: string }>; error?: string }>;
         repairMessageQuotes:(params: { accountId: string; chatId: string; items: Array<{ messageId: string; replyToId: string }> }) => Promise<{ success: boolean; results?: Array<{ messageId: string; replyToId: string; status: 'repaired' | 'topic_routing' | 'not_found' | 'deferred' | 'invalid'; quoteData?: string }>; error?: string }>;

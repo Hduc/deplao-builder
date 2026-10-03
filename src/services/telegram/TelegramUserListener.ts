@@ -366,6 +366,16 @@ async function reconcileTelegramDialogMembership(
 
     const mainDialogs = await client.getDialogs({ limit: MEMBERSHIP_RECONCILE_DIALOG_LIMIT });
     const archivedDialogs = await client.getDialogs({ limit: MEMBERSHIP_RECONCILE_DIALOG_LIMIT, folder: 1 });
+    // TG-03: `getDialogs` caps at MEMBERSHIP_RECONCILE_DIALOG_LIMIT per call.
+    // Absence from a truncated snapshot only means "not in this page", not
+    // "the account left the channel". Demotion requires a complete snapshot
+    // (or, later, an explicit member/left/forbidden signal).
+    const snapshotLegComplete = (list: any[]): boolean => {
+      const total = Number((list as any)?.total ?? list.length);
+      return list.length < MEMBERSHIP_RECONCILE_DIALOG_LIMIT && total <= list.length;
+    };
+    const snapshotComplete = snapshotLegComplete(mainDialogs) && snapshotLegComplete(archivedDialogs);
+
     const seen = new Set<string>();
     for (const dialog of [...mainDialogs, ...archivedDialogs]) {
       const chatId = getCanonicalChatId(dialog.id);
@@ -375,10 +385,22 @@ async function reconcileTelegramDialogMembership(
       persistTelegramDialogState(accountId, chatId, dialog, dialog.entity, undefined, false);
     }
 
+    if (!snapshotComplete) {
+      Logger.warn(
+        `[TelegramUserListener] Membership snapshot truncated for ${accountId} `
+        + `(main ${mainDialogs.length}/${(mainDialogs as any)?.total ?? '?'}, `
+        + `archive ${archivedDialogs.length}/${(archivedDialogs as any)?.total ?? '?'}); `
+        + 'keeping existing member states instead of demoting from a partial view',
+      );
+      membershipReconciledAccounts.add(accountId);
+      EventBroadcaster.emit('db:unreadChanged', { zaloId: accountId, source: 'telegram_membership_reconcile' });
+      return;
+    }
+
     // `getDialogs` contains every peer the account currently belongs to,
     // including archived peers. A normal-inbox channel absent from that
-    // snapshot is an old/unjoined row and must not remain eligible for live
-    // ingest or occupy the All tab.
+    // complete snapshot is an old/unjoined row and must not remain eligible
+    // for live ingest or occupy the All tab.
     const memberRows = db.query<{ contact_id: string }>(
       `SELECT contact_id FROM contacts
        WHERE owner_zalo_id = ? AND channel = 'telegram_user'
@@ -671,6 +693,7 @@ function getTelegramHistoryCheckpoint(db: DatabaseService, accountId: string, ch
 
 /** Keep native mention ranges so the renderer never has to guess from a raw @. */
 function getTelegramMentionAttachments(message: any): Record<string, any>[] {
+  const text = String(message?.message || message?.text || '');
   return (message?.entities || [])
     .filter((entity: any) =>
       entity?.className === 'MessageEntityMentionName'
@@ -684,11 +707,19 @@ function getTelegramMentionAttachments(message: any): Record<string, any>[] {
       const userId = ['string', 'number', 'bigint'].includes(typeof rawUserId)
         ? String(rawUserId)
         : '';
+      const offset = Math.max(0, Number(entity?.offset || 0));
+      const length = Math.max(0, Number(entity?.length || 0));
+      // A MessageEntityMention is an @username token and deliberately has no
+      // userId. Preserve that token so the renderer can resolve it on click.
+      const username = entity?.className === 'MessageEntityMention'
+        ? text.slice(offset, offset + length).replace(/^@/, '')
+        : '';
       return {
         type: 'telegram_mention',
-        offset: Math.max(0, Number(entity?.offset || 0)),
-        length: Math.max(0, Number(entity?.length || 0)),
+        offset,
+        length,
         user_id: userId,
+        username,
       };
     })
     .filter((entity: any) => entity.length > 0);
@@ -826,6 +857,7 @@ function normalizeTelegramMessageMedia(message: any, peerType?: TelegramPeerType
     attachments.push({
       type: 'poll', id: String(poll?.id || ''), question,
       closed: !!poll?.closed, multiple_choice: !!poll?.multipleChoice, quiz: !!poll?.quiz,
+      open_answers: !!poll?.openAnswers,
       total_voters: Number(media?.results?.totalVoters || 0),
       answers: (poll?.answers || []).map((answer: any) => {
         const option = Buffer.from(answer?.option || []).toString('base64');
@@ -1301,7 +1333,19 @@ function startHealthCheck(listener: ActiveListener): void {
     listener.healthCheckClient = client;
     try {
       if (!client.connected) throw new Error('MTProto transport disconnected');
-      await client.getMe();
+      // TG-04: getMe() has no transport-level deadline. A hung RPC previously
+      // kept healthCheckClient latched forever, which made every later tick
+      // return early — the account looked healthy while nothing was probing it.
+      const PROBE_TIMEOUT_MS = 15_000;
+      let probeTimeout: ReturnType<typeof setTimeout> | undefined;
+      await Promise.race([
+        client.getMe(),
+        new Promise<never>((_, reject) => {
+          probeTimeout = setTimeout(() => reject(new Error('health_probe_timeout')), PROBE_TIMEOUT_MS);
+        }),
+      ]).finally(() => {
+        if (probeTimeout) clearTimeout(probeTimeout);
+      });
       if (listener.client !== client || listener.stopped) return;
       listener.connected = true;
       listener.retryCount = 0;
@@ -1417,7 +1461,7 @@ const channelDialogWatchStates = new Map<string, {
 }>();
 const channelDialogWatchTasks = new Map<string, Promise<void>>();
 
-const channelDifferenceQueues = new Map<string, Promise<ChannelDifferenceResult>>();
+const channelDifferenceQueues = new Map<string, { client: TelegramClient; promise: Promise<ChannelDifferenceResult> }>();
 /** Channels explicitly marked by a live PTS gap/server hint or a failed
  * reconnect recovery. This replaces the old arbitrary first-10 DB scan. */
 // The value is the earliest PTS supplied by UpdateChannelTooLong. Telegram
@@ -1789,20 +1833,20 @@ async function recoverQueuedChannel(
     if (recovered === 'complete' || recovered === 'unavailable') {
       clearChannelRecoveryPending(accountId, channelId);
       if (queued.priority >= URGENT_CHANNEL_RECOVERY_PRIORITY) {
-        Logger.log(`[TelegramUserListener] Live channel recovery completed for ${channelId}`);
+        // Logger.log(`[TelegramUserListener] Live channel recovery completed for ${channelId}`);
       }
       return 'complete';
     }
     // drainChannelDifference handles FLOOD_WAIT internally and persists its
     // retry_at. Read it back so this worker pool pauses globally instead of
     // continuing other channel history/difference requests during the wait.
-    const retry = db.queryOne<{ retry_at: number }>(
+    const retry6 = db.queryOne<{ retry_at: number }>(
       `SELECT retry_at FROM telegram_channel_recovery_queue
        WHERE owner_zalo_id = ? AND channel_id = ?`,
       [accountId, channelId],
     );
-    if (Number(retry?.retry_at || 0) > Date.now()) {
-      const waitMs = Math.max(1_000, Number(retry!.retry_at) - Date.now());
+    if (Number(retry6?.retry_at || 0) > Date.now()) {
+      const waitMs = Math.max(1_000, Number(retry6!.retry_at) - Date.now());
       applyChannelRecoveryFloodWait(accountId, new Error(`FLOOD_WAIT_${Math.ceil(waitMs / 1000)}`));
       return 'flood';
     }
@@ -1935,13 +1979,19 @@ async function drainChannelDifference(
 ): Promise<ChannelDifferenceResult> {
   const queueKey = `${accountId}:${channelId}`;
   const existing = channelDifferenceQueues.get(queueKey);
-  if (existing) return existing;
+  // TG-04: single-flight is per (account, channel, *client generation*).
+  // Handing a pending promise from a retired client to the new one meant the
+  // fresh connection sat waiting on an RPC that would never come back after
+  // the transport was torn down.
+  if (existing && existing.client === client) return existing.promise;
   const task = drainChannelDifferenceNow(accountId, client, channelId, accessHash, startingPts, source);
-  channelDifferenceQueues.set(queueKey, task);
+  const entry = { client, promise: task };
+  channelDifferenceQueues.set(queueKey, entry);
   try {
     return await task;
   } finally {
-    if (channelDifferenceQueues.get(queueKey) === task) channelDifferenceQueues.delete(queueKey);
+    // Only clear our own entry; a newer client may already own the key.
+    if (channelDifferenceQueues.get(queueKey) === entry) channelDifferenceQueues.delete(queueKey);
   }
 }
 
@@ -2880,19 +2930,27 @@ async function connectListenerNow(listener: ActiveListener): Promise<void> {
               ? [msgIdStr, account.accountId, deletedThreadId]
               : [msgIdStr, account.accountId];
             const existingMsg = db.queryOne<any>(
-              `SELECT content FROM messages WHERE ${scope}`, scopeParams
+              `SELECT content, msg_type, recalled_content, recalled_msg_type FROM messages WHERE ${scope}`, scopeParams
             );
-            const recalledContent = existingMsg?.content || null;
-            Logger.log(`[TelegramUserListener] Recall msg ${msgIdStr}: content="${(recalledContent || '').slice(0, 100)}" scope=${scope} deletedThreadId=${deletedThreadId || 'none'}`);
+            const recalledContent = existingMsg?.recalled_content ?? existingMsg?.content ?? null;
+            const recalledMsgType = existingMsg?.recalled_msg_type
+              || (existingMsg?.msg_type !== 'recalled' ? existingMsg?.msg_type : null);
+            Logger.log(`[TelegramUserListener] Recall msg ${msgIdStr}: content="${(recalledContent || '').slice(0, 100)}" type=${recalledMsgType || '-'} scope=${scope} deletedThreadId=${deletedThreadId || 'none'}`);
             if (deletedThreadId) {
               db.run(
-                `UPDATE messages SET msg_type = 'recalled', status = 'recalled', is_recalled = 1, recalled_content = ? WHERE msg_id = ? AND owner_zalo_id = ? AND thread_id = ? AND channel = 'telegram_user'`,
-                [recalledContent, msgIdStr, account.accountId, deletedThreadId]
+                `UPDATE messages SET msg_type = 'recalled', status = 'recalled', is_recalled = 1,
+                 recalled_content = CASE WHEN recalled_content IS NULL OR recalled_content = '' THEN ? ELSE recalled_content END,
+                 recalled_msg_type = CASE WHEN recalled_msg_type IS NULL OR recalled_msg_type = '' THEN ? ELSE recalled_msg_type END
+                 WHERE msg_id = ? AND owner_zalo_id = ? AND thread_id = ? AND channel = 'telegram_user'`,
+                [recalledContent, recalledMsgType, msgIdStr, account.accountId, deletedThreadId]
               );
             } else {
               db.run(
-                `UPDATE messages SET msg_type = 'recalled', status = 'recalled', is_recalled = 1, recalled_content = ? WHERE msg_id = ? AND owner_zalo_id = ? AND channel = 'telegram_user'`,
-                [recalledContent, msgIdStr, account.accountId]
+                `UPDATE messages SET msg_type = 'recalled', status = 'recalled', is_recalled = 1,
+                 recalled_content = CASE WHEN recalled_content IS NULL OR recalled_content = '' THEN ? ELSE recalled_content END,
+                 recalled_msg_type = CASE WHEN recalled_msg_type IS NULL OR recalled_msg_type = '' THEN ? ELSE recalled_msg_type END
+                 WHERE msg_id = ? AND owner_zalo_id = ? AND channel = 'telegram_user'`,
+                [recalledContent, recalledMsgType, msgIdStr, account.accountId]
               );
             }
           }
@@ -4439,7 +4497,18 @@ async function synchronizeTelegramAccount(
   options: { includeHistory?: boolean; recoverRecentChannels?: boolean } = {}
 ): Promise<TelegramAccountSyncResult> {
   if (recoveringUpdateAccounts.has(accountId)) {
-    return { success: false, historyComplete: false, inserted: 0 };
+    // TG-04: a reconnect that lands while a previous recovery is still
+    // finishing must not be reported as a failed sync. Wait (bounded) for the
+    // current owner to release the account instead of failing fast — that
+    // made reconnect look broken while recovery was perfectly healthy.
+    const LOCK_WAIT_MS = 60_000;
+    const deadline = Date.now() + LOCK_WAIT_MS;
+    while (recoveringUpdateAccounts.has(accountId) && Date.now() < deadline) {
+      await new Promise(resolve => setTimeout(resolve, 100));
+    }
+    if (recoveringUpdateAccounts.has(accountId)) {
+      return { success: false, historyComplete: false, inserted: 0 };
+    }
   }
   recoveringUpdateAccounts.add(accountId);
   try {
@@ -4463,7 +4532,7 @@ async function synchronizeTelegramAccount(
     const differenceResult = await recoverTelegramUpdateDifference(accountId, client);
     // Channel cursors are the realtime catch-up path. Run them before the broad
     // dialog history backfill, which may hit messages.GetHistory FLOOD_WAIT.
-    await recoverChannelUpdates(accountId, client, {
+    const channelResult = await recoverChannelUpdates(accountId, client, {
       includeRecentDialogs: !!options.includeHistory || !!options.recoverRecentChannels,
     });
 
@@ -4471,7 +4540,7 @@ async function synchronizeTelegramAccount(
     // Running a broad GetHistory pass anyway races channel difference (history
     // can insert first, causing the realtime path to dedup without a UI event)
     // and creates the FLOOD_WAIT storm observed during forum navigation.
-    if (differenceResult === 'complete' && !options.includeHistory) {
+    if (differenceResult === 'complete' && !options.includeHistory && channelResult.ok) {
       DatabaseService.getInstance()?.repairTelegramLastMessagePreviews(accountId, 'telegram_user');
       return { success: true, historyComplete: true, inserted: 0 };
     }
@@ -4483,9 +4552,11 @@ async function synchronizeTelegramAccount(
       await saveCurrentTelegramUpdateState(accountId, client);
     }
     DatabaseService.getInstance()?.repairTelegramLastMessagePreviews(accountId, 'telegram_user');
+    // TG-06: history succeeding does not launder a failed channel recovery
+    // into `success: true`. The caller (and the UI progress) must see it.
     return {
-      success: historyResult.success && differenceResult !== 'failed',
-      historyComplete: historyResult.complete,
+      success: historyResult.success && differenceResult !== 'failed' && channelResult.ok,
+      historyComplete: historyResult.complete && channelResult.ok,
       inserted: historyResult.inserted,
     };
   } finally {
@@ -4613,9 +4684,10 @@ async function recoverChannelUpdates(
   accountId: string,
   client: TelegramClient,
   options: { includeRecentDialogs?: boolean } = {},
-): Promise<void> {
+): Promise<{ ok: boolean; errors: string[] }> {
   const db = DatabaseService.getInstance();
-  if (!db) return;
+  if (!db) return { ok: false, errors: ['no_db'] };
+  const errors: string[] = [];
 
   try {
     // Phase 1: Enqueue all channels known in DB with appropriate priority
@@ -4643,7 +4715,6 @@ async function recoverChannelUpdates(
           const pageDialogs = dialogs.slice(page * DIALOG_PAGE_SIZE, (page + 1) * DIALOG_PAGE_SIZE);
           if (pageDialogs.length === 0) break;
 
-          let foundNew = false;
           for (const dialog of pageDialogs) {
             const channelId = getCanonicalChatId(dialog.id);
             if (!channelId?.startsWith('-100')) continue;
@@ -4659,25 +4730,33 @@ async function recoverChannelUpdates(
                LIMIT 1`,
               [accountId, channelId],
             );
-            // Only enqueue if channel has some local data (cursor or messages)
+            const entityAny = dialog.entity as any;
             if (hasCursor || hasMessages) {
               const priority = hasCursor ? 30 : 10;
-              const entityAny = dialog.entity as any;
               db.enqueueChannelRecovery(accountId, channelId, entityAny?.accessHash || '', db.getTelegramChannelPts(accountId, channelId), priority);
-              foundNew = true;
+            } else {
+              // TG-01: a member channel we have never synced must still get a
+              // bootstrap job. Gating on local history meant newly joined /
+              // newly discovered channels stayed silent until the user opened
+              // them by hand.
+              db.enqueueChannelRecovery(accountId, channelId, entityAny?.accessHash || '', 0, 5);
             }
           }
-
-          if (!foundNew && page > 0) break; // No new channels found, stop pagination
+          // TG-01: never stop because this slice happened to hold only DMs or
+          // already-known channels. A later slice/page may still contain
+          // channels that need recovery; only the end of the list stops us.
         } catch (err: any) {
           tgLog('warn', accountId, 'channel_difference', `Dialog page ${page} failed: ${err.message}`);
+          errors.push(`dialog_page:${err.message}`);
           break;
         }
       }
 
-      // Also scan archived dialogs
+      // Also scan archived dialogs. TG-02: "Khác" must get the same inventory
+      // budget as the main folder — a single 100-dialog page silently dropped
+      // every archived channel past that page.
       try {
-        const archivedDialogs = await client.getDialogs({ limit: DIALOG_PAGE_SIZE, folder: 1 });
+        const archivedDialogs = await client.getDialogs({ limit: MAX_DIALOG_PAGES * DIALOG_PAGE_SIZE, folder: 1 });
         for (const dialog of archivedDialogs) {
           const channelId = getCanonicalChatId(dialog.id);
           if (!channelId?.startsWith('-100') || discoveredChannelIds.has(channelId)) continue;
@@ -4690,13 +4769,16 @@ async function recoverChannelUpdates(
              LIMIT 1`,
             [accountId, channelId],
           );
+          const entityAny = dialog.entity as any;
           if (hasCursor || hasMessages) {
-            const entityAny = dialog.entity as any;
             db.enqueueChannelRecovery(accountId, channelId, entityAny?.accessHash || '', db.getTelegramChannelPts(accountId, channelId), hasCursor ? 30 : 10);
+          } else {
+            db.enqueueChannelRecovery(accountId, channelId, entityAny?.accessHash || '', 0, 5);
           }
         }
       } catch (err: any) {
         tgLog('warn', accountId, 'channel_difference', `Archived dialog scan failed: ${err.message}`);
+        errors.push(`archive_scan:${err.message}`);
       }
     }
 
@@ -4740,7 +4822,9 @@ async function recoverChannelUpdates(
     db.cleanupChannelRecoveryQueue(accountId);
   } catch (err: any) {
     tgLog('warn', accountId, 'channel_difference', `recoverChannelUpdates error: ${err.message}`);
+    errors.push(`recover:${err.message}`);
   }
+  return { ok: errors.length === 0, errors };
 }
 
 /** Check if the listener for this account has been stopped. */
@@ -4786,6 +4870,8 @@ async function fetchMissedMessages(accountId: string, client: TelegramClient): P
   if (!db || syncingAccounts.has(accountId)) return { success: false, complete: false, inserted: 0 };
   syncingAccounts.add(accountId);
   let needsFollowUpSync = false;
+  let inventoryTruncated = false;
+  let archiveFetchFailed = false;
 
   try {
     // Lấy thời gian tin nhắn cuối cùng đã lưu trong DB
@@ -4805,7 +4891,19 @@ async function fetchMissedMessages(accountId: string, client: TelegramClient): P
     try {
       archivedDialogs = await client.getDialogs({ limit: dialogLimit, folder: 1 });
     } catch (err: any) {
+      archiveFetchFailed = true;
       Logger.warn(`[TelegramUserListener] Failed to fetch archived dialogs: ${err.message}`);
+    }
+
+    // TG-06: a capped dialog list is not a complete inventory. GramJS returns a
+    // TotalList whose `total` is the server-side count; if either leg was cut
+    // off we must not report this pass as a finished recovery epoch.
+    const inventoryLegTruncated = (list: any[], limit: number): boolean => {
+      const total = Number((list as any)?.total ?? list.length);
+      return list.length >= limit || total > list.length;
+    };
+    if (inventoryLegTruncated(dialogs, dialogLimit) || inventoryLegTruncated(archivedDialogs, dialogLimit)) {
+      inventoryTruncated = true;
     }
 
     // Gộp dialogs, dedup theo chatId (archived có thể trùng với main nếu user archive/recently)
@@ -4952,7 +5050,14 @@ async function fetchMissedMessages(accountId: string, client: TelegramClient): P
 
     // Broadcast để UI refresh
     EventBroadcaster.emit('db:unreadChanged', { zaloId: accountId, source: 'telegram_sync' });
-    return { success: true, complete: !needsFollowUpSync, inserted: totalSynced };
+    // TG-06: success/complete must describe what this pass actually covered.
+    // A failed archive leg or a truncated dialog list is partial work — the
+    // scheduler needs to see that, not a green checkmark.
+    return {
+      success: !archiveFetchFailed,
+      complete: !needsFollowUpSync && !inventoryTruncated && !archiveFetchFailed,
+      inserted: totalSynced,
+    };
   } catch (err: any) {
     Logger.warn(`[TelegramUserListener] fetchMissedMessages error: ${err.message}`);
     return { success: false, complete: false, inserted: 0 };
@@ -5583,13 +5688,21 @@ export async function sendMessage(accountId: string, chatId: string, text: strin
         quoteData = JSON.stringify({ msgId: replyToMsgId, msg: '', senderId: '', msgType: 'text' });
       }
     }
+    const mentionAttachments = (mentions || [])
+      .map((mention) => ({
+        type: 'telegram_mention',
+        offset: Math.max(0, Number(mention.pos || 0)),
+        length: Math.max(0, Number(mention.len || 0)),
+        user_id: String(mention.uid || ''),
+      }))
+      .filter((mention) => mention.user_id && mention.length > 0 && mention.offset + mention.length <= text.length);
     const db = DatabaseService.getInstance();
     if (db) {
       db.run(`
         INSERT OR IGNORE INTO messages
           (msg_id, owner_zalo_id, thread_id, thread_type, sender_id, content, msg_type, timestamp, is_sent, attachments, status, channel, reply_to_id, quote_data)
-        VALUES (?, ?, ?, ?, ?, ?, 'text', ?, 1, '[]', 'sent', 'telegram_user', ?, ?)
-      `, [msgId, accountId, chatId, threadType, accountId, text, now, replyToMsgId || null, quoteData]);
+        VALUES (?, ?, ?, ?, ?, ?, 'text', ?, 1, ?, 'sent', 'telegram_user', ?, ?)
+      `, [msgId, accountId, chatId, threadType, accountId, text, now, JSON.stringify(mentionAttachments), replyToMsgId || null, quoteData]);
 
       // Update contacts (last_message, last_message_time) — đảm bảo conversation list cập nhật ngay
       db.run(`
@@ -5622,6 +5735,7 @@ export async function sendMessage(accountId: string, chatId: string, text: strin
           ts: String(now),
           replyToId: replyToMsgId || undefined,
           quoteData: quoteData || undefined,
+          attachments: mentionAttachments,
         },
       },
     });
@@ -5903,8 +6017,8 @@ export async function deleteMessages(accountId: string, chatId: string, messageI
 export async function getMessages(
   accountId: string,
   chatId: string,
-  opts?: { limit?: number; offsetId?: number; topicRootMessageId?: string }
-): Promise<{ success: boolean; messages?: any[]; error?: string }> {
+  opts?: { limit?: number; offsetId?: number; topicRootMessageId?: string; returnMessages?: boolean }
+): Promise<{ success: boolean; messages?: any[]; count?: number; error?: string }> {
   const listener = activeListeners.get(accountId);
   if (!listener?.client || !listener.connected) return { success: false, error: 'Not connected' };
 
@@ -6075,13 +6189,25 @@ export async function getMessages(
         scheduledMediaDownloads++;
         downloadMediaForMessage(accountId, listener.client, msg, msgId, msgType, chatId).catch(() => {});
       }
+
+      // History imports can contain thousands of rows. Yield periodically so
+      // Electron can paint, handle IPC, and keep the connection heartbeat alive
+      // instead of monopolising the main process in one synchronous loop.
+      if (messages.length % 100 === 0) {
+        await new Promise<void>(resolve => setImmediate(resolve));
+      }
     }
 
     // Notify UI to refresh contacts from DB (updates last_message/time in conversation list)
     if (messages.length > 0) {
       EventBroadcaster.emit('db:unreadChanged', { zaloId: accountId, source: 'telegram_get_messages' });
     }
-    return { success: true, messages };
+    // Manual history import only needs the persisted rows. Returning thousands
+    // of rich message objects across IPC duplicates memory in main/preload/
+    // renderer and makes the chat appear frozen.
+    return opts?.returnMessages === false
+      ? { success: true, count: messages.length }
+      : { success: true, messages, count: messages.length };
   } catch (err: any) {
     return { success: false, error: err.message };
   }
@@ -8912,3 +9038,30 @@ export async function downloadSticker(accountId: string, stickerId: string, acce
     return { success: false, error: err.message };
   }
 }
+
+// ─── Test seams ──────────────────────────────────────────────────────────────
+// Recovery/discovery/lifecycle helpers below are module-private because the
+// listener is the only production caller. Regression tests for the sleep/wake
+// audit (docs/sleep-wake-network-reconnect-audit-plan.md) need to exercise the
+// real implementations with fake clients, so expose a narrow namespace here
+// instead of duplicating the logic in test fixtures.
+// Replace these with proper module APIs as the recovery coordinator lands.
+export const __test = {
+  drainChannelDifference,
+  drainChannelDifferenceNow,
+  synchronizeTelegramAccount,
+  fetchMissedMessages,
+  recoverChannelUpdates,
+  reconcileTelegramDialogMembership,
+  startHealthCheck,
+  clearHealthCheck,
+  scheduleReconnectCatchUp,
+  runChannelRecoveryWorkers,
+  channelDifferenceQueues,
+  recoveringUpdateAccounts,
+  syncingAccounts,
+  membershipReconciledAccounts,
+  membershipReconciliations,
+  reconnectCatchUps,
+  activeListeners,
+};

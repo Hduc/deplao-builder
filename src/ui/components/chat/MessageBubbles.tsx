@@ -41,6 +41,65 @@ export interface MessageBubbleProps {
   onOpenProfile?: (userId: string, e: React.MouseEvent) => void;
 }
 
+// A recalled message is stored with an empty current body.  Keep the original
+// type separate from the body: assigning the old body to `msg_type` made text
+// appear to work by accident while every recalled image/file lost its renderer.
+const RECALL_PLACEHOLDER = JSON.stringify({ msg: 'Tin nhắn đã bị thu hồi' });
+
+function inferRecallMediaType(msg: MessageItem): string | null {
+  const candidates: string[] = [];
+  try {
+    const paths = typeof msg.local_paths === 'string'
+      ? JSON.parse(msg.local_paths || '{}')
+      : (msg.local_paths || {});
+    candidates.push(...Object.values(paths || {}).filter((value): value is string => typeof value === 'string'));
+  } catch {}
+  try {
+    const attachments = typeof msg.attachments === 'string'
+      ? JSON.parse(msg.attachments || '[]')
+      : (msg.attachments || []);
+    for (const attachment of Array.isArray(attachments) ? attachments : []) {
+      candidates.push(String(attachment?.file_name || attachment?.fileName || attachment?.name || attachment?.mime_type || ''));
+    }
+  } catch {}
+
+  const value = candidates.join(' ').toLowerCase();
+  if (!value) return null;
+  if (/\.(tgs|webp)(?:\s|$)/.test(value)) return 'sticker';
+  if (/\.(mp4|mov|mkv|webm|avi|m4v)(?:\s|$)/.test(value)) return 'video';
+  if (/\.(mp3|ogg|opus|m4a|wav|aac|flac)(?:\s|$)/.test(value)) return 'audio';
+  if (/\.(jpe?g|png|gif|webp|bmp|tiff?|ico)(?:\s|$)/.test(value) || /image\//.test(value)) return 'image';
+  return 'file';
+}
+
+function getRecalledPreviewType(msg: MessageItem, originalContent: string): string {
+  const storedType = String(msg.recalled_msg_type || '');
+  const inferredType = inferRecallMediaType(msg);
+
+  // Image documents frequently come as `file`; use their actual media shape.
+  if ((storedType === 'file' || !storedType) && inferredType && inferredType !== 'file') return inferredType;
+  if (storedType && storedType !== 'recalled') return storedType;
+  if (isMediaType('file', originalContent, msg.attachments)) return 'image';
+  if (isFileType('file', originalContent, msg.attachments)) return 'file';
+  return inferredType || 'webchat';
+}
+
+function canPreviewRecalled(msg: MessageItem, originalContent: string): boolean {
+  const content = String(originalContent || '').trim();
+  if (content && content !== 'null' && content !== '{}' && content !== RECALL_PLACEHOLDER) return true;
+  return getRecalledPreviewType(msg, content) !== 'webchat';
+}
+
+function getRecalledPreviewMessage(msg: MessageItem, originalContent: string): MessageItem {
+  return {
+    ...msg,
+    is_recalled: 0,
+    status: '',
+    msg_type: getRecalledPreviewType(msg, originalContent),
+    content: originalContent === RECALL_PLACEHOLDER ? '' : originalContent,
+  };
+}
+
 // ── StickerBubble ─────────────────────────────────────────────────────────────
 function StickerBubble({ msg }: { msg: any }) {
   const [stickerUrl, setStickerUrl] = React.useState<string | null>(null);
@@ -1786,7 +1845,7 @@ export function MessageBubble({ msg, isSelf, senderName, onManage, onView, onOpe
   const isRecalled = msg.is_recalled === 1 || msg.status === 'recalled' || mt === 'recalled';
   if (isRecalled) {
     const originalContent = msg.recalled_content || mc;
-    const hasOriginal = !!(originalContent && originalContent.trim() !== '' && originalContent !== 'null' && originalContent !== '{}');
+    const hasOriginal = canPreviewRecalled(msg, originalContent);
     return (
       <div className={`flex flex-col ${isSelf ? 'items-end' : 'items-start'} gap-1 mb-0.5`}>
         <div className="flex items-center gap-1.5 px-3 py-1.5 rounded-2xl bg-gray-700/50 border border-gray-600/50 text-gray-400 text-xs italic select-none">
@@ -1808,7 +1867,7 @@ export function MessageBubble({ msg, isSelf, senderName, onManage, onView, onOpe
         {showRecalledOriginal && hasOriginal && (
           <div className="opacity-50 pointer-events-none select-none">
             <MessageBubble
-              msg={{ ...msg, is_recalled: 0, status: '', msg_type: originalContent }}
+              msg={getRecalledPreviewMessage(msg, originalContent)}
               isSelf={isSelf}
               senderName={senderName}
               onManage={onManage}
@@ -2019,11 +2078,7 @@ export function RecalledBubble({
   onToggleReveal: () => void;
 }) {
   const originalContent = msg.recalled_content || '';
-  const hasContent = !!(
-    originalContent &&
-    originalContent.trim() &&
-    originalContent !== JSON.stringify({ msg: 'Tin nhắn đã bị thu hồi' })
-  );
+  const hasContent = canPreviewRecalled(msg, originalContent);
 
   return (
     <div className="flex flex-col gap-1 max-w-[320px]">
@@ -2053,11 +2108,7 @@ export function RecalledBubble({
         <div className="opacity-50 pointer-events-none select-none">
           <MessageBubble
             msg={{
-              ...msg,
-              is_recalled: 0,
-              status: '',
-              msg_type: msg.msg_type === 'recalled' ? 'webchat' : msg.msg_type,
-              content: originalContent,
+              ...getRecalledPreviewMessage(msg, originalContent),
             }}
             isSelf={isSelf}
             senderName={displayName}

@@ -1957,7 +1957,7 @@ export default function MessageInput() {
                   body: msgText,
                   threadType: activeThreadType,
                   quote: quotePayload,
-                  ...(isTelegramUser(activeChannel) && mentions.length > 0 ? { mentions } : {}),
+                  ...(isTelegram(activeChannel) && mentions.length > 0 ? { mentions } : {}),
                 });
               if (!res?.success) return { success: false, error: res?.error || 'Gửi tin nhắn Facebook thất bại' };
               return { success: true, msgId: res?.messageId };

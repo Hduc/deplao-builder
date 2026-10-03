@@ -20,6 +20,7 @@ export class TelegramBotAdapter extends BaseChannelAdapter {
         accountId: params.accountId,
         chatId: params.threadId,
         text: params.body,
+        mentions: params.mentions,
       });
       return { success: res?.success ?? false, msgId: res?.messageId, messageId: res?.messageId, error: res?.error };
     } catch (err: any) {

@@ -70,6 +70,54 @@ export interface TelegramMessage {
   replyToMessageId?: string;
 }
 
+function normalizeBotPollAttachment(poll: any): any {
+  return {
+    type: 'poll',
+    id: String(poll?.id || ''),
+    poll_id: String(poll?.id || ''),
+    question: String(poll?.question || 'Bình chọn'),
+    closed: !!poll?.is_closed,
+    is_closed: !!poll?.is_closed,
+    multiple_choice: !!poll?.allows_multiple_answers,
+    allows_multiple_answers: !!poll?.allows_multiple_answers,
+    quiz: !!poll?.type && poll.type === 'quiz',
+    open_answers: !!poll?.allows_add_options,
+    allows_add_options: !!poll?.allows_add_options,
+    is_anonymous: !!poll?.is_anonymous,
+    total_voters: Number(poll?.total_voter_count || 0),
+    total_voter_count: Number(poll?.total_voter_count || 0),
+    options: (poll?.options || []).map((option: any) => ({
+      text: String(typeof option === 'string' ? option : option?.text || ''),
+      voters: Number(option?.voter_count || 0),
+      voter_count: Number(option?.voter_count || 0),
+      persistent_id: String(option?.persistent_id || ''),
+    })),
+  };
+}
+
+/** Preserve Bot API mention entities for text and captions. */
+function getBotMentionAttachments(text: string, entities: any): any[] {
+  if (!Array.isArray(entities)) return [];
+  return entities
+    .filter((entity: any) => entity?.type === 'mention' || entity?.type === 'text_mention')
+    .map((entity: any) => {
+      const offset = Math.max(0, Number(entity?.offset || 0));
+      const length = Math.max(0, Number(entity?.length || 0));
+      const userId = entity?.user?.id ?? entity?.user_id ?? '';
+      const username = entity?.type === 'mention'
+        ? String(text || '').slice(offset, offset + length).replace(/^@/, '')
+        : '';
+      return {
+        type: 'telegram_mention',
+        offset,
+        length,
+        user_id: userId === undefined || userId === null ? '' : String(userId),
+        username,
+      };
+    })
+    .filter((mention: any) => mention.length > 0 && mention.offset + mention.length <= String(text || '').length);
+}
+
 // ─── Ingress consumer (inbox handler) ───────────────────────────────────────
 
 /**
@@ -218,16 +266,14 @@ async function handleInboundMessage(account: BotAccount, message: any): Promise<
       longitude: message.venue.location?.longitude,
     }];
   } else if (message.poll) {
-    msgType = 'poll';
+    msgType = 'telegram.poll';
     content = message.poll.question || '';
-    attachments = [{
-      type: 'poll',
-      question: message.poll.question,
-      options: message.poll.options?.map((o: any) => o.text) || [],
-      is_anonymous: message.poll.is_anonymous,
-      poll_id: message.poll.id || '',
-    }];
+    attachments = [normalizeBotPollAttachment(message.poll)];
   }
+
+  // Bot API puts entities for captions in caption_entities, not entities.
+  const entities = message.text ? message.entities : message.caption_entities;
+  attachments.push(...getBotMentionAttachments(content, entities));
 
   // Reply-to
   let replyToMessageId: string | undefined;
@@ -378,6 +424,106 @@ async function saveMessage(msg: TelegramMessage, botToken?: string): Promise<voi
   } catch (err: any) {
     Logger.error(`[TelegramBotChannel] saveMessage error: ${err.message}`);
   }
+}
+
+/** Edited poll updates carry the full current Poll object. Persist it against
+ * the original message so existing bubbles refresh instead of adding a second
+ * poll message. */
+async function updateBotPollMessage(account: BotAccount, rawMessage: any): Promise<void> {
+  const poll = rawMessage?.poll;
+  const chatId = String(rawMessage?.chat?.id || '');
+  const messageId = String(rawMessage?.message_id || '');
+  if (!poll || !chatId || !messageId) return;
+
+  const attachments = [normalizeBotPollAttachment(poll)];
+  const content = String(poll.question || 'Bình chọn');
+  const timestamp = Number(rawMessage?.edit_date || rawMessage?.date || Math.floor(Date.now() / 1000)) * 1000;
+  DatabaseService.getInstance()?.run(
+    `UPDATE messages SET content = ?, msg_type = 'telegram.poll', attachments = ?, is_edited = 1
+     WHERE msg_id = ? AND owner_zalo_id = ? AND thread_id = ? AND channel = 'telegram_bot'`,
+    [content, JSON.stringify(attachments), messageId, account.accountId, chatId],
+  );
+
+  EventBroadcaster.emit('event:message', {
+    zaloId: account.accountId,
+    channel: 'telegram_bot',
+    message: {
+      channel: 'telegram_bot', type: String(rawMessage?.chat?.type || '') === 'private' ? 0 : 1,
+      threadId: chatId, isSelf: String(rawMessage?.from?.id || '') === account.accountId,
+      data: {
+        uidFrom: String(rawMessage?.from?.id || ''), idTo: chatId, msgId: messageId,
+        content, preview: getTelegramMessagePreview('telegram.poll', content),
+        msgType: 'telegram.poll', channel: 'telegram_bot', ts: String(timestamp),
+        dName: [rawMessage?.from?.first_name, rawMessage?.from?.last_name].filter(Boolean).join(' '), attachments,
+      },
+    },
+  });
+}
+
+/** Bot API delivers vote changes as a standalone `poll` update, without the
+ * enclosing chat message. Match it to the poll rows we saved and refresh each
+ * matching bubble from the authoritative option counts. */
+async function updateBotPollResults(account: BotAccount, poll: any): Promise<void> {
+  const pollId = String(poll?.id || '');
+  if (!pollId) return;
+  const db = DatabaseService.getInstance();
+  if (!db) return;
+
+  const candidates = db.query<any>(
+    `SELECT msg_id, thread_id, thread_type, sender_id, is_sent, attachments
+     FROM messages
+     WHERE owner_zalo_id = ? AND channel = 'telegram_bot' AND msg_type = 'telegram.poll'
+       AND attachments LIKE ?`,
+    [account.accountId, `%'id":"${pollId}"%`],
+  );
+
+  const attachments = [normalizeBotPollAttachment(poll)];
+  for (const candidate of candidates) {
+    let existingPollId = '';
+    try {
+      const stored = JSON.parse(candidate.attachments || '[]');
+      existingPollId = String(stored.find((item: any) => item?.type === 'poll')?.id || '');
+    } catch {}
+    if (existingPollId !== pollId) continue;
+
+    db.run(
+      `UPDATE messages SET attachments = ? WHERE msg_id = ? AND owner_zalo_id = ? AND thread_id = ? AND channel = 'telegram_bot'`,
+      [JSON.stringify(attachments), candidate.msg_id, account.accountId, candidate.thread_id],
+    );
+    EventBroadcaster.emit('event:message', {
+      zaloId: account.accountId,
+      channel: 'telegram_bot',
+      message: {
+        channel: 'telegram_bot', type: Number(candidate.thread_type || 0), threadId: candidate.thread_id,
+        isSelf: Number(candidate.is_sent || 0) === 1,
+        _silentNotification: true,
+        data: {
+          uidFrom: String(candidate.sender_id || ''), idTo: candidate.thread_id, msgId: candidate.msg_id,
+          content: String(poll.question || 'Bình chọn'), preview: getTelegramMessagePreview('telegram.poll'),
+          msgType: 'telegram.poll', channel: 'telegram_bot', ts: String(Date.now()), attachments,
+        },
+      },
+    });
+  }
+}
+
+async function handleBotPollOptionAdded(account: BotAccount, rawMessage: any): Promise<void> {
+  const added = rawMessage?.poll_option_added;
+  if (!added) return;
+  const pollMessage = added?.poll_message;
+  if (pollMessage?.poll) await updateBotPollMessage(account, pollMessage);
+
+  const optionId = String(added?.option_persistent_id || '');
+  const option = (pollMessage?.poll?.options || []).find((item: any) => String(item?.persistent_id || '') === optionId);
+  const fromName = [rawMessage?.from?.first_name, rawMessage?.from?.last_name].filter(Boolean).join(' ')
+    || String(rawMessage?.from?.username || rawMessage?.from?.id || 'Thành viên');
+  const optionText = String(option?.text || 'một lựa chọn mới');
+
+  await handleInboundMessage(account, {
+    ...rawMessage,
+    text: `${fromName} đã thêm “${optionText}” vào bình chọn`,
+    poll_option_added: undefined,
+  });
 }
 
 // ─── Contact Avatar (Bot API) ────────────────────────────────────────────────
@@ -649,6 +795,7 @@ export interface TelegramBotSendMessageParams {
   parseMode?: string;
   /** Native Telegram reply_markup payload (ReplyKeyboardMarkup/InlineKeyboardMarkup). */
   replyMarkup?: Record<string, any>;
+  mentions?: Array<{ uid: string; pos: number; len: number }>;
 }
 
 /**
@@ -664,14 +811,33 @@ export async function sendMessage(
   const params: TelegramBotSendMessageParams = typeof accountOrParams === 'string'
     ? { accountId: accountOrParams, chatId: legacyChatId || '', text: legacyText || '', parseMode: legacyParseMode }
     : accountOrParams;
-  const { accountId, chatId, text, parseMode, replyMarkup } = params;
+  const { accountId, chatId, text, parseMode, replyMarkup, mentions } = params;
   const bot = registeredAccounts.get(accountId);
   if (!bot) return { success: false, error: 'Bot not active' };
   if (!bot.botToken) return { success: false, error: 'Bot token missing' };
 
   try {
     const payload: Record<string, any> = { chat_id: chatId, text };
-    if (parseMode) payload.parse_mode = parseMode;
+    const mentionAttachments = (mentions || [])
+      .map((mention) => ({
+        type: 'telegram_mention',
+        offset: Math.max(0, Number(mention.pos || 0)),
+        length: Math.max(0, Number(mention.len || 0)),
+        user_id: String(mention.uid || ''),
+      }))
+      .filter((mention) => mention.user_id && mention.length > 0 && mention.offset + mention.length <= text.length);
+    // Bot API text_mention needs a complete User object. A tg://user link is
+    // the supported portable equivalent when the composer only has the ID.
+    if (mentionAttachments.length > 0) {
+      payload.entities = mentionAttachments.map((mention) => ({
+        type: 'text_link',
+        offset: mention.offset,
+        length: mention.length,
+        url: `tg://user?id=${mention.user_id}`,
+      }));
+    } else if (parseMode) {
+      payload.parse_mode = parseMode;
+    }
     if (replyMarkup) payload.reply_markup = replyMarkup;
 
     const res = await axios.post(`${TELEGRAM_API}/bot${bot.botToken}/sendMessage`, payload, {
@@ -708,6 +874,7 @@ export async function sendMessage(
       msgType: 'text',
       timestamp: Date.now(),
       isSelf: true,
+      attachments: mentionAttachments,
     });
 
     // Emit event so UI updates (self-sent messages won't come via polling)
@@ -729,6 +896,7 @@ export async function sendMessage(
           channel: 'telegram_bot',
           ts: String(Date.now()),
           dName: bot.botFirstName,
+          attachments: mentionAttachments,
         },
       },
     });
@@ -1087,7 +1255,19 @@ export async function sendPoll(accountId: string, chatId: string, question: stri
       is_anonymous: false,
     }, { timeout: REQUEST_TIMEOUT });
     if (!res.data?.ok) return { success: false, error: res.data?.description || 'Telegram API error' };
-    return { success: true, messageId: String(res.data.result?.message_id || '') };
+    const result = res.data.result || {};
+    const messageId = String(result.message_id || '');
+    if (messageId) {
+      await saveSentBotMessage(
+        accountId,
+        chatId,
+        messageId,
+        String(result.poll?.question || question),
+        'telegram.poll',
+        [normalizeBotPollAttachment(result.poll || { question, options })],
+      );
+    }
+    return { success: true, messageId };
   } catch (err: any) {
     return { success: false, error: err.message };
   }
@@ -1400,10 +1580,15 @@ export function startBot(account: TelegramBotAccount): void {
     // Handle both regular messages and channel posts
     if ((update.kind === 'message' || update.kind === 'channel_post') && update.message) {
       Logger.log(`[TelegramBot] Processing message from ${update.message.fromName}: ${(update.message.text || '').slice(0, 50)}`);
+      if (update.message.raw?.poll_option_added) {
+        await handleBotPollOptionAdded(acc, update.message.raw);
+        return;
+      }
       await handleInboundMessage(acc, update.message.raw);
     }
     if ((update.kind === 'edited_message' || update.kind === 'edited_channel_post') && update.editedMessage) {
       const message = update.editedMessage;
+      if (message.raw?.poll) await updateBotPollMessage(acc, message.raw);
       EventBroadcaster.emit('event:telegramBotEditedMessage', {
         zaloId: acc.accountId,
         accountId: acc.accountId,
@@ -1430,6 +1615,9 @@ export function startBot(account: TelegramBotAccount): void {
         },
         rawUpdate: update.raw,
       });
+    }
+    if (update.kind === 'poll' && update.poll) {
+      await updateBotPollResults(acc, update.poll);
     }
     if (update.kind === 'chat_join_request' && update.chatJoinRequest) {
       const request = update.chatJoinRequest;

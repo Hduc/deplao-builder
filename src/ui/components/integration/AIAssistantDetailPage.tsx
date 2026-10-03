@@ -11,6 +11,7 @@ import {showConfirm} from "@/components/common/ConfirmDialog";
 import { Spinner } from '@/components/common/PageLoading';
 import PromptWizardModal from './PromptWizardModal';
 import { parseStructuredResponse } from '../../../utils/aiUtils';
+import { AI_MODEL_OPTIONS, DEFAULT_AI_MODELS, normalizeAIModel } from '../../../shared/aiModelCatalog';
 import { AlertIcon, BookIcon, BotIcon, ChartIcon, ChatIcon, CheckIcon, ChevronDownIcon, ChevronUpIcon, ClipboardListIcon, EditIcon, FileTextIcon, GlobeIcon, HardDriveIcon, KeyIcon, LightningIcon, LinkIcon, PackageIcon, PaperclipIcon, PinIcon, RefreshIcon, SearchIcon, SettingsIcon, ShoppingCartIcon, ShuffleIcon, SparklesIcon, SunIcon, TargetIcon, TrashIcon } from '@/components/common/icons';
 
 // ─── Constants ────────────────────────────────────────────────────────────────
@@ -56,7 +57,7 @@ const MODELS_BY_PLATFORM: Record<string, { value: string; label: string }[]> = {
     { value: 'claude-3-5-haiku-20241022',   label: 'Claude 3.5 Haiku (legacy)' },
   ],
   deepseek: [
-    { value: 'deepseek-v4-flash',   label: 'DeepSeek V4 Flash (mới nhất - khuyên dùng)' },
+    { value: 'deepseek-flash',      label: 'DeepSeek Flash (mới nhất - khuyên dùng)' },
     { value: 'deepseek-v4-pro',     label: 'DeepSeek V4 Pro (thinking, mạnh nhất)' },
     { value: 'deepseek-chat',       label: 'DeepSeek V3 (deprecated 2026/07/24)' },
     { value: 'deepseek-reasoner',   label: 'DeepSeek R1 (deprecated 2026/07/24)' },
@@ -106,6 +107,18 @@ const MODELS_BY_PLATFORM: Record<string, { value: string; label: string }[]> = {
     { value: '__custom__',                  label: 'Custom model - tự nhập...' },
   ],
 };
+
+// Provider model IDs are shared with the backend adapter so the choice shown
+// here is always the ID sent to the provider API.
+Object.assign(MODELS_BY_PLATFORM, {
+  openai: AI_MODEL_OPTIONS.openai,
+  gemini: AI_MODEL_OPTIONS.gemini,
+  claude: AI_MODEL_OPTIONS.claude,
+  deepseek: AI_MODEL_OPTIONS.deepseek,
+  grok: AI_MODEL_OPTIONS.grok,
+  mistral: AI_MODEL_OPTIONS.mistral,
+  openrouter: [...AI_MODEL_OPTIONS.openrouter, { value: '__custom__', label: 'Custom model - tự nhập...' }],
+});
 
 interface AIFile {
   id: number;
@@ -196,7 +209,7 @@ export default function AIAssistantDetailPage({ assistantId, onBack }: Props) {
   const [platform, setPlatform] = useState('openai');
   const [apiKey, setApiKey] = useState('');
   const [showApiKey, setShowApiKey] = useState(false);
-  const [model, setModel] = useState('gpt-5.4-mini');
+  const [model, setModel] = useState(DEFAULT_AI_MODELS.openai);
   const [customModelInput, setCustomModelInput] = useState('');
   const [baseUrl, setBaseUrl] = useState('');
   const [systemPrompt, setSystemPrompt] = useState('');
@@ -279,7 +292,7 @@ export default function AIAssistantDetailPage({ assistantId, onBack }: Props) {
           setName(a.name || '');
           setPlatform(a.platform || 'openai');
           setApiKey(a.apiKey || '');
-          setModel(a.model || 'gpt-5.4-mini');
+          setModel(normalizeAIModel(a.platform || 'openai', a.model));
           setBaseUrl(a.baseUrl || '');
           setSystemPrompt(a.systemPrompt || '');
           setPosIntegrationId(a.posIntegrationId || '');

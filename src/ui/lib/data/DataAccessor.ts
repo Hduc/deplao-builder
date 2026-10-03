@@ -208,9 +208,22 @@ export class DataAccessor {
       }
       return { success: true, items: [], total: 0, hasMore: false };
     }
-    const ipcRes = await window.electronAPI.db.getContacts(zaloId);
-    const contactList = ipcRes?.contacts ?? ipcRes ?? [];
-    return { success: true, items: contactList, total: contactList.length || 0, hasMore: false };
+    // Keep the initial conversation list bounded. The extra row tells the UI
+    // whether to request the next page without serializing all contacts over IPC.
+    const pageSize = Math.min(Math.max(Math.floor(Number(limit) || 50), 1), 500);
+    const ipcRes = await window.electronAPI.db.getContactsFiltered({
+      zaloId,
+      limit: pageSize + 1,
+      offset: Math.max(Math.floor(Number(offset) || 0), 0),
+    });
+    const contactList = ipcRes?.contacts ?? [];
+    const hasMore = contactList.length > pageSize;
+    return {
+      success: true,
+      items: hasMore ? contactList.slice(0, pageSize) : contactList,
+      total: contactList.length,
+      hasMore,
+    };
     }
 
   static async searchConversations(zaloId: string, query: string) {
@@ -582,12 +595,12 @@ export class DataAccessor {
   // DASHBOARD / ANALYTICS (11 methods)
   // ═════════════════════════════════════════════════════════════════
 
-  static async getDashboardOverview(zaloId: string) {
+  static async getDashboardOverview(params: { zaloId: string; sinceTs?: number; untilTs?: number; threadType?: number }) {
     if (isEmployee()) {
-      const res = await rest().get('/api/query/analytics/dashboard', { zaloId });
+      const res = await rest().get('/api/query/analytics/dashboard', params);
       return { success: true, data: res.data };
     }
-    return window.electronAPI.analytics.dashboardOverview({ zaloId });
+    return window.electronAPI.analytics.dashboardOverview(params);
   }
 
   static async getMessageVolume(params: {

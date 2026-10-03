@@ -214,16 +214,13 @@ func (c *Client) Connect() (*UserInfo, *InitialData, error) {
 	// bootstrap; cutoff zero-grace vẫn loại mọi message có trước Connect().
 	c.openRealtimeMessageWindow(0)
 
-	// Load messages page
+	// Load the recent inbox page. This is data recovery, not a live event: the
+	// caller persists it without replaying workflow triggers.
 	currentUser, initialTable, err := c.Messagix.LoadMessagesPage(c.ctx)
 	if err != nil {
 		return nil, nil, err
 	}
-	if initialTable != nil {
-		for _, thread := range initialTable.LSDeleteThenInsertThread {
-			c.cacheThread(convertThread(thread))
-		}
-	}
+	initialData := c.collectInitialData(initialTable)
 
 	// Extract user info
 	userInfo := &UserInfo{
@@ -245,7 +242,56 @@ func (c *Client) Connect() (*UserInfo, *InitialData, error) {
 		return nil, nil, err
 	}
 
-	return userInfo, nil, nil
+	return userInfo, initialData, nil
+}
+
+// SyncHistory reloads the recent Messenger page and returns it as data for the
+// parent to persist. It intentionally does not emit message events: old
+// messages must never re-run bot rules or notification workflows.
+func (c *Client) SyncHistory() (*InitialData, error) {
+	if err := c.lifecycleError(); err != nil {
+		return nil, err
+	}
+	_, initialTable, err := c.Messagix.LoadMessagesPage(c.ctx)
+	if err != nil {
+		return nil, err
+	}
+	return c.collectInitialData(initialTable), nil
+}
+
+func (c *Client) collectInitialData(initialTable *table.LSTable) *InitialData {
+	data := &InitialData{}
+	if initialTable == nil {
+		return data
+	}
+
+	for _, rawThread := range initialTable.LSDeleteThenInsertThread {
+		thread := convertThread(rawThread)
+		c.cacheThread(thread)
+		data.Threads = append(data.Threads, thread)
+	}
+
+	upsert, insert := initialTable.WrapMessages()
+	seen := make(map[string]struct{})
+	appendMessage := func(wrapped *table.WrappedMessage) {
+		if wrapped == nil || wrapped.MessageId == "" {
+			return
+		}
+		if _, exists := seen[wrapped.MessageId]; exists {
+			return
+		}
+		seen[wrapped.MessageId] = struct{}{}
+		data.Messages = append(data.Messages, c.convertWrappedMessage(wrapped))
+	}
+	for _, batch := range upsert {
+		for _, wrapped := range batch.Messages {
+			appendMessage(wrapped)
+		}
+	}
+	for _, wrapped := range insert {
+		appendMessage(wrapped)
+	}
+	return data
 }
 
 // ConnectE2EE sets up and connects the E2EE client
@@ -261,13 +307,32 @@ func (c *Client) ConnectE2EE() error {
 		return nil
 	}
 
-	// Prepare E2EE client
-	e2eeClient, err := c.Messagix.PrepareE2EEClient()
-	if err != nil {
-		return err
+	if c.DeviceStore == nil || c.DeviceStore.Device == nil {
+		return errors.New("E2EE device store is not initialized")
+	}
+
+	// Registering is a one-time operation. Re-registering a restored device
+	// changes its server identity and can invalidate the persisted session used
+	// to decrypt incoming messages after an app restart.
+	deviceID := c.DeviceStore.Device.ID
+	if deviceID == nil || deviceID.User == "" || deviceID.Device == 0 {
+		if err := c.Messagix.RegisterE2EE(c.ctx, c.FBID); err != nil {
+			return fmt.Errorf("register E2EE device: %w", err)
+		}
+		if err := c.DeviceStore.Save(); err != nil {
+			return fmt.Errorf("failed to persist E2EE device after registration: %w", err)
+		}
 	}
 	if err := c.lifecycleError(); err != nil {
 		return err
+	}
+
+	// This must happen after any first-time registration. fbchat-v2 prepares
+	// whatsmeow from the already-registered device so restored sessions retain
+	// their original keys and JID.
+	e2eeClient, err := c.Messagix.PrepareE2EEClient()
+	if err != nil {
+		return fmt.Errorf("prepare E2EE client: %w", err)
 	}
 	c.lifecycleMu.Lock()
 	if c.disconnected || c.ctx.Err() != nil {
@@ -276,14 +341,6 @@ func (c *Client) ConnectE2EE() error {
 	}
 	c.E2EE = e2eeClient
 	c.lifecycleMu.Unlock()
-
-	// Register E2EE
-	if err := c.Messagix.RegisterE2EE(c.ctx, c.FBID); err != nil {
-		return err
-	}
-	if err := c.DeviceStore.Save(); err != nil {
-		return fmt.Errorf("failed to persist E2EE device after registration: %w", err)
-	}
 	if err := c.lifecycleError(); err != nil {
 		return err
 	}
@@ -294,11 +351,15 @@ func (c *Client) ConnectE2EE() error {
 
 	// Connect E2EE
 	if err := e2eeClient.ConnectContext(c.ctx); err != nil {
-		return err
+		return fmt.Errorf("connect E2EE socket: %w", err)
 	}
 	if err := c.lifecycleError(); err != nil {
 		e2eeClient.Disconnect()
 		return err
+	}
+	if err := waitForE2EEReady(c.ctx, e2eeClient, 45*time.Second); err != nil {
+		e2eeClient.Disconnect()
+		return fmt.Errorf("wait for E2EE authentication: %w", err)
 	}
 
 	return nil
@@ -376,6 +437,34 @@ type e2eeConnectionState interface {
 
 func isE2EEReady(state e2eeConnectionState) bool {
 	return state != nil && state.IsConnected() && state.IsLoggedIn()
+}
+
+// waitForE2EEReady closes the gap between whatsmeow accepting ConnectContext
+// and the encrypted socket completing its login handshake. Returning from the
+// RPC before IsLoggedIn becomes true makes the parent immediately tear down a
+// healthy connection that is still negotiating after an app restart.
+func waitForE2EEReady(ctx context.Context, state e2eeConnectionState, timeout time.Duration) error {
+	if isE2EEReady(state) {
+		return nil
+	}
+
+	ticker := time.NewTicker(200 * time.Millisecond)
+	defer ticker.Stop()
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-timer.C:
+			return fmt.Errorf("E2EE socket authentication did not complete within %s", timeout)
+		case <-ticker.C:
+			if isE2EEReady(state) {
+				return nil
+			}
+		}
+	}
 }
 
 // IsConnected returns true if connected

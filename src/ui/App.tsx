@@ -1,8 +1,7 @@
-import React, { useCallback, useEffect, useState, useRef } from 'react';
+import React, { Suspense, useCallback, useEffect, useState, useRef } from 'react';
 import TopBar from './components/layout/TopBar';
 import Sidebar from './components/layout/Sidebar';
 import AccountPanel from './components/layout/AccountPanel';
-import Dashboard from './components/dashboard/Dashboard';
 import ConversationList from './components/chat/ConversationList';
 import ChatHeader from './components/chat/ChatHeader';
 import ChatWindow from './components/chat/ChatWindow';
@@ -14,12 +13,6 @@ import AIQuickPanel from './components/integration/AIQuickPanel';
 import ReminderNotification from './components/chat/ReminderNotification';
 import FriendRequestNotification, { FriendRequestNotifData } from './components/common/FriendRequestNotification';
 import QuickChatModal from './components/chat/QuickChatModal';
-import Settings from './components/settings/Settings';
-import CRMPage from './components/crm/CRMPage';
-import WorkflowPage from './components/workflow/WorkflowPage';
-import IntegrationPage from './components/integration/IntegrationPage';
-import AnalyticsPage from './components/analytics/AnalyticsPage';
-import ErpPage from './features/erp/ErpPage';
 import AccountInitPanel from './components/common/AccountInitPanel';
 import AccountSwitcherOverlay from './components/common/AccountSwitcherOverlay';
 import { UpdateNotification } from './components/common/UpdateNotification';
@@ -44,6 +37,16 @@ import LockScreen from './components/auth/LockScreen';
 import { Spinner } from '@/components/common/PageLoading';
 import { GlobeIcon } from '@/components/common/icons';
 import { CHANNEL, isZalo, isNonZalo, isFacebook } from '@/lib/channelHelper';
+
+// These pages pull in editors, charts, React Flow and large ERP modules. They
+// are not needed for the first chat frame, so defer them until their view opens.
+const Dashboard = React.lazy(() => import('./components/dashboard/Dashboard'));
+const Settings = React.lazy(() => import('./components/settings/Settings'));
+const CRMPage = React.lazy(() => import('./components/crm/CRMPage'));
+const WorkflowPage = React.lazy(() => import('./components/workflow/WorkflowPage'));
+const IntegrationPage = React.lazy(() => import('./components/integration/IntegrationPage'));
+const AnalyticsPage = React.lazy(() => import('./components/analytics/AnalyticsPage'));
+const ErpPage = React.lazy(() => import('./features/erp/ErpPage'));
 
 const HEALTH_CHECK_INTERVAL_MS = 60 * 1000; // 1 phút
 const NETWORK_RECONNECT_COOLDOWN_MS = 15 * 1000; // 15 giây
@@ -170,6 +173,7 @@ export default function App() {
   const [initializing, setInitializing] = useState(true);
   const [lockEnabled, setLockEnabled] = useState(false);
   const [isLocked, setIsLocked] = useState(false);
+  const startupInitStartedRef = useRef(false);
   const isMobile = useIsMobile();
   const { mobileShowChat, setMobileShowChat } = useAppStore();
 
@@ -1054,7 +1058,10 @@ export default function App() {
       const body = data?.message?.body;
       const threadId = data?.message?.replyToID || '';
       const accountId = data?.fbAccountId || '';
-      const isSelf = data?.message?.isSelf || (data?.message?.senderID === accountId);
+      // The backend owns Facebook sender attribution. `senderID` was not
+      // even the event field name (`userID` is), and client-side fallback can
+      // mark another participant's message as the logged-in account.
+      const isSelf = data?.message?.isSelf === true;
 
       // Don't notify for own messages
       if (isSelf) return;
@@ -1160,6 +1167,17 @@ export default function App() {
 
   // Initialize on app start
   useEffect(() => {
+    // React StrictMode intentionally mounts effects twice in development. The
+    // old startup effect therefore loaded contacts and tried reconnects twice.
+    if (startupInitStartedRef.current) return;
+    startupInitStartedRef.current = true;
+
+    // Tell the main process that React has committed a frame before it starts
+    // expensive channel recovery. A large contact table must not hold the
+    // window blank while startup hydration is still running.
+    ipc.app?.rendererReady?.();
+    setInitializing(false);
+
     const init = async () => {
       try {
         // 1. Load saved accounts
@@ -1167,23 +1185,11 @@ export default function App() {
         if (accountsRes?.accounts) {
           setAccounts(accountsRes.accounts);
 
-          // 2. Load contacts for each account
-          for (const acc of accountsRes.accounts) {
-            const contactsRes = await ipc.db?.getContacts(acc.zalo_id);
-            if (contactsRes?.contacts) {
-              setContacts(acc.zalo_id, contactsRes.contacts);
-            }
-          }
-
-          // 2b. Load muted + others flags trước khi tính badge
-          //     (nếu không, isInOthers/isMuted luôn trả false → badge sai)
+          // ConversationList loads the visible account in pages. Loading every
+          // contact here serializes a large payload over IPC before first paint.
           const { loadFlags } = useAppStore.getState();
-          for (const acc of accountsRes.accounts) {
-            await loadFlags(acc.zalo_id);
-          }
-
-          // Sync badge
-          ipc.app?.setBadge(getFilteredUnreadCount());
+          void Promise.allSettled(accountsRes.accounts.map((acc: any) => loadFlags(acc.zalo_id)))
+            .then(() => ipc.app?.setBadge(getFilteredUnreadCount()));
 
           // 3. Auto-reconnect saved Zalo accounts (ONLY for boss/local workspace)
           // Employee (remote) workspace must NOT connect Zalo directly -
@@ -1585,44 +1591,15 @@ export default function App() {
             </>
           )}
 
-          {view === 'settings' && (
-            <div className="flex-1 h-full overflow-hidden">
-              <Settings />
-            </div>
-          )}
-
-          {view === 'crm' && (
-            <div className="flex-1 h-full overflow-hidden">
-              <CRMPage />
-            </div>
-          )}
-
-          {view === 'workflow' && (
-            <div className="flex-1 h-full overflow-hidden">
-              <WorkflowPage />
-            </div>
-          )}
-
-          {view === 'integration' && (
-            <div className="flex-1 h-full overflow-hidden">
-              <IntegrationPage />
-            </div>
-          )}
-
-
-          {view === 'analytics' && (
-            <div className="flex-1 h-full overflow-hidden">
-              <AnalyticsPage />
-            </div>
-          )}
-          {view === 'erp' && (
-            <div className="flex-1 h-full overflow-hidden">
-              <ErpPage />
-            </div>
-          )}
-          {view === 'dashboard' && (
-            <Dashboard />
-          )}
+          <Suspense fallback={<div className="flex flex-1 items-center justify-center"><Spinner size={8} /></div>}>
+            {view === 'settings' && <div className="flex-1 h-full overflow-hidden"><Settings /></div>}
+            {view === 'crm' && <div className="flex-1 h-full overflow-hidden"><CRMPage /></div>}
+            {view === 'workflow' && <div className="flex-1 h-full overflow-hidden"><WorkflowPage /></div>}
+            {view === 'integration' && <div className="flex-1 h-full overflow-hidden"><IntegrationPage /></div>}
+            {view === 'analytics' && <div className="flex-1 h-full overflow-hidden"><AnalyticsPage /></div>}
+            {view === 'erp' && <div className="flex-1 h-full overflow-hidden"><ErpPage /></div>}
+            {view === 'dashboard' && <Dashboard />}
+          </Suspense>
         </div>
       </div>
 

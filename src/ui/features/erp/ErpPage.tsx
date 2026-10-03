@@ -26,6 +26,18 @@ export default function ErpPage() {
     loadProfiles();
   }, [loadEmployees, loadProfiles]);
 
+  // Allow the global feature launcher to open a specific ERP section.
+  useEffect(() => {
+    const handler = (event: Event) => {
+      const next = (event as CustomEvent).detail?.subView as ErpSubView | undefined;
+      if (next && ['inbox', 'tasks', 'calendar', 'notes', 'hrm', 'reports'].includes(next)) {
+        setSubView(next);
+      }
+    };
+    window.addEventListener('nav:erp', handler);
+    return () => window.removeEventListener('nav:erp', handler);
+  }, []);
+
   const navItems: { id: ErpSubView; label: string; icon: React.ReactNode; show?: boolean }[] = [
     {
       id: 'inbox',

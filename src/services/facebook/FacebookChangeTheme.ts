@@ -7,6 +7,7 @@
 import axios from 'axios';
 import { FBSessionData } from './FacebookTypes';
 import { buildFormData, rateLimitDelay } from './FacebookUtils';
+import { assertFacebookMutationSuccess, parseFacebookResponse } from './FacebookGraphQLResult';
 import Logger from '../../utils/Logger';
 
 const GRAPHQL_URL = 'https://www.facebook.com/webgraphql/mutation/';
@@ -49,7 +50,7 @@ export async function changeThreadTheme(
 
   try {
     const formBody = new URLSearchParams(form).toString();
-    await axios.post(GRAPHQL_URL, formBody, {
+    const response = await axios.post(GRAPHQL_URL, formBody, {
       headers: {
         'Host': 'www.facebook.com',
         'Content-Type': 'application/x-www-form-urlencoded',
@@ -61,6 +62,7 @@ export async function changeThreadTheme(
       timeout: 30000,
       ...(httpsAgent ? { httpsAgent } : {}),
     });
+    assertFacebookMutationSuccess('changeThreadTheme', parseFacebookResponse(response.data as string));
     return { success: true };
   } catch (err: any) {
     Logger.error(`[FacebookChangeTheme] error: ${err.message}`);

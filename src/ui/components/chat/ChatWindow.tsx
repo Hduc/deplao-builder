@@ -27,11 +27,12 @@ import { useEmployeeStore } from '@/store/employeeStore';
 import { ChatIcon } from '@/components/common/icons';
 import { handleAvatarError } from '@/lib/avatarRetry';
 import { EMOJI_TO_REACTION } from '@/lib/chat/emojiUtils';
-import { parseContent, parseQuoteMsg, extractQuoteImage, extractMediaUrl, formatMsgTime, extractMsgText, getTelegramMentionRanges } from '@/lib/chat/messageParser';
+import { parseContent, parseQuoteMsg, extractQuoteImage, extractMediaUrl, formatMsgTime, extractMsgText, getMentionRanges } from '@/lib/chat/messageParser';
 import { isCardType, isEcardType, isFileType, isStickerType, isRtfMsg, isMediaType, isVideoType, isVoiceType, isBankCardType } from '@/lib/chat/messageTypeUtils';
 import { NoteViewModal } from './NoteViewModal';
 import ForwardMessageModal from './ForwardMessageModal';
 import PollBubble from './PollBubble';
+import TelegramPollBubble from './TelegramPollBubble';
 import FriendRequestBar from './FriendRequestBar';
 import { ReactionContextMenu, ReactionPopup, parseReactions, parseReactionsFull, displayReactionEmoji } from './ReactionComponents';
 import {
@@ -632,7 +633,7 @@ export default function ChatWindow() {
       const isEcard = isEcardType(mt);
       const isSticker = isStickerType(mt);
       const isRtf = isRtfMsg(mt, mc);
-      const isPoll = mt === 'group.poll';
+      const isPoll = mt === 'group.poll' || mt === 'telegram.poll' || (mt === 'poll' && isTelegramCh(msg.channel));
       const isVideo = isVideoType(mt);
       const isVoice = mt === 'chat.voice' || mt === 'audio';
       const isGroupMedia = !isPoll && !isVoice && !!groupedFirstMsgs[msg.msg_id];
@@ -2831,7 +2832,11 @@ export default function ChatWindow() {
           const isEcardMsg = cached?.isEcard ?? isEcardType(msg.msg_type);
           const isStickerMsg = cached?.isSticker ?? isStickerType(msg.msg_type);
           const isRtf = cached?.isRtf ?? isRtfMsg(msg.msg_type, msg.content);
-          const isPollMsg = cached?.isPoll ?? (msg.msg_type === 'group.poll');
+          const isPollMsg = cached?.isPoll ?? (
+            msg.msg_type === 'group.poll'
+            || msg.msg_type === 'telegram.poll'
+            || (msg.msg_type === 'poll' && isTelegramCh(msg.channel))
+          );
           const isVideoMsg = cached?.isVideo ?? isVideoType(msg.msg_type);
           const isVoiceMsg = cached?.isVoice ?? (msg.msg_type === 'chat.voice' || msg.msg_type === 'audio');
           const isBankCardMsg = isBankCardType(msg.msg_type, msg.content);
@@ -3165,9 +3170,10 @@ export default function ChatWindow() {
                         onToggleSelect={(id) => {
                         setSelectedMsgIds(prev => { const next = new Set(prev); if (next.has(id)) next.delete(id); else next.add(id); return next; });
                       }} onVideoPlay={openVideoPlayer} />}
-                      renderPoll={() => (
-                        <PollBubble msg={msg} isSent={isSent} activeAccountId={activeAccountId || ''} threadId={activeThreadId || ''} />
-                      )}
+                      renderPoll={() => msg.msg_type === 'group.poll'
+                        ? <PollBubble msg={msg} isSent={isSent} activeAccountId={activeAccountId || ''} threadId={activeThreadId || ''} />
+                        : <TelegramPollBubble msg={msg} isSent={isSent} />
+                      }
                       renderVideo={() => {
                         let videoPath = '';
                         try {
@@ -3213,6 +3219,8 @@ export default function ChatWindow() {
                         <CardBubble
                           msg={msg}
                           isSent={isSent}
+                          allContacts={contactList}
+                          groupMembersList={groupMembers}
                           onOpenProfile={(userId, e) => setUserProfilePopup({ userId, x: e.clientX, y: e.clientY })}
                         />
                       )}
@@ -3235,7 +3243,7 @@ export default function ChatWindow() {
                       renderText={() => (
                         <>
                           <TextWithMentions text={content} channel={msg.channel} allContacts={contactList} groupMembersList={groupMembers}
-                            mentionRanges={getTelegramMentionRanges(msg.attachments)}
+                            mentionRanges={getMentionRanges(msg.attachments)}
                             highlight={searchHighlightQuery}
                             onMentionClick={(uid, e) => setUserProfilePopup({ userId: uid, x: e.clientX, y: e.clientY })} />
                           {msg.is_edited === 1 && (
@@ -3330,7 +3338,7 @@ export default function ChatWindow() {
                       : [];
                     return (
                       <div
-                        className={`absolute -bottom-3 z-2 transition-opacity duration-100${!hasReactions ? ' opacity-0 group-hover/msg:opacity-100' : ''}${isSent ? ' right-0' : ' left-0'}`}
+                        className={`absolute -bottom-2 z-20 transition-opacity duration-100${!hasReactions ? ' opacity-0 group-hover/msg:opacity-100' : ''}${isSent ? ' right-1.5' : ' left-1.5'}`}
                         onMouseEnter={() => setReactionPickerMsgId(msg.msg_id)}
                         onMouseLeave={() => setReactionPickerMsgId(null)}
                       >

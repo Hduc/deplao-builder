@@ -312,6 +312,10 @@ html[data-theme="light"] ::-webkit-scrollbar-thumb:hover {
 /* Custom colors used in UserProfilePopup */
 html[data-theme="light"] .bg-\[\#1e2535\]     { background-color: #f0ede8; }
 html[data-theme="light"] .border-\[\#1e2535\] { border-color: #f0ede8; }
+/* Telegram album grid + poll card use these dark fills; without a light
+   equivalent they stay near-black on the cream theme. */
+html[data-theme="light"] .bg-\[\#242f3d\]     { background-color: #f0ede8; }
+html[data-theme="light"] .bg-\[\#2a2f42\]     { background-color: #e8e4de; }
 
 html[data-theme="light"] .bg-gray-950  { background-color: #f0ede8; }
 html[data-theme="light"] .bg-gray-900  { background-color: #f7f6f3; }

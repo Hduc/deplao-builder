@@ -6,7 +6,8 @@
 
 import axios from 'axios';
 import { FBSessionData } from './FacebookTypes';
-import { buildFormData, buildPostConfig, rateLimitDelay } from './FacebookUtils';
+import { buildFormData, rateLimitDelay } from './FacebookUtils';
+import { assertFacebookMutationSuccess, parseFacebookResponse } from './FacebookGraphQLResult';
 import Logger from '../../utils/Logger';
 
 const GRAPHQL_URL = 'https://www.facebook.com/webgraphql/mutation/';
@@ -37,7 +38,7 @@ export async function blockUser(
 
   try {
     const formBody = new URLSearchParams(form).toString();
-    await axios.post(GRAPHQL_URL, formBody, {
+    const response = await axios.post(GRAPHQL_URL, formBody, {
       headers: {
         'Host': 'www.facebook.com',
         'Content-Type': 'application/x-www-form-urlencoded',
@@ -49,6 +50,7 @@ export async function blockUser(
       timeout: 30000,
       ...(httpsAgent ? { httpsAgent } : {}),
     });
+    assertFacebookMutationSuccess('blockUser', parseFacebookResponse(response.data as string));
     return { success: true };
   } catch (err: any) {
     Logger.error(`[FacebookBlock] blockUser error: ${err.message}`);
@@ -82,7 +84,7 @@ export async function unblockUser(
 
   try {
     const formBody = new URLSearchParams(form).toString();
-    await axios.post(GRAPHQL_URL, formBody, {
+    const response = await axios.post(GRAPHQL_URL, formBody, {
       headers: {
         'Host': 'www.facebook.com',
         'Content-Type': 'application/x-www-form-urlencoded',
@@ -94,6 +96,7 @@ export async function unblockUser(
       timeout: 30000,
       ...(httpsAgent ? { httpsAgent } : {}),
     });
+    assertFacebookMutationSuccess('unblockUser', parseFacebookResponse(response.data as string));
     return { success: true };
   } catch (err: any) {
     Logger.error(`[FacebookBlock] unblockUser error: ${err.message}`);

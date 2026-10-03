@@ -18,6 +18,33 @@ import * as fs from 'fs';
 import { google } from 'googleapis';
 import { parseStructuredResponse, isValidStructuredResponse } from '../../utils/aiUtils';
 import { CHANNEL } from '../../ui/lib/channelHelper';
+import { Reactions } from 'zca-js';
+import { requestAICompletion } from '../ai/AIProviderAdapter';
+
+// Workflow versions before reaction keys were introduced stored the six picker
+// options as numbers. Keep those workflows executable while sending the icon
+// value that zca-js and Zalo actually accept.
+const ZALO_WORKFLOW_REACTIONS: Record<string, string> = {
+  '1': Reactions.LIKE,
+  '2': Reactions.HEART,
+  '3': Reactions.HAHA,
+  '4': Reactions.WOW,
+  '5': Reactions.CRY,
+  '6': Reactions.ANGRY,
+  LIKE: Reactions.LIKE,
+  HEART: Reactions.HEART,
+  HAHA: Reactions.HAHA,
+  WOW: Reactions.WOW,
+  CRY: Reactions.CRY,
+  ANGRY: Reactions.ANGRY,
+};
+
+function resolveZaloWorkflowReaction(value: unknown): string | null {
+  const reaction = String(value ?? '').trim();
+  if (!reaction) return null;
+  return ZALO_WORKFLOW_REACTIONS[reaction.toUpperCase()]
+    || ((Object.values(Reactions) as string[]).includes(reaction) ? reaction : null);
+}
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -1239,15 +1266,18 @@ class WorkflowEngineService {
       }
       return {
         fromId:      msgData.uidFrom    || (msg as any).uidFrom    || data.fromId    || '',
-        fromName:    data.fromName      || msgData.dName            || (msg as any).fromName || '',
+        fromName:    data.fromName      || msgData.dName            || msgData.senderInfo?.displayName
+          || msgData.senderInfo?.zaloName || msgData.senderInfo?.name || (msg as any).fromName || '',
         fromPhone:   data.fromPhone     || (msg as any).fromPhone   || '',
         content,
         images,
         threadId:    (msg as any).threadId || data.threadId        || msgData.idTo   || '',
         threadType,
         isGroup,
-        groupName:   data.groupName     || (msg as any).groupName  || '',
+        groupName:   data.groupName     || (msg as any).groupName  || msgData.groupName
+          || msgData.groupInfo?.name || msgData.group?.name || '',
         msgId:       msgData.msgId      || (msg as any).msgId       || data.msgId    || '',
+        cliMsgId:    msgData.cliMsgId   || (msg as any).cliMsgId    || data.cliMsgId || '',
         timestamp:   Number(msgData.ts) || Number((msg as any).ts) || data.timestamp || Date.now(),
         isSelf:      !!((msg as any).isSelf || data.isSelf),
         zaloId:      data.zaloId || '',
@@ -1777,8 +1807,49 @@ class WorkflowEngineService {
 
       case 'zalo.addReaction': {
         const api = this.getApi(ctx.pageId);
-        await api.addReaction({ msgId: cfg.msgId, clientMsgId: cfg.clientMsgId || '' } as any, Number(cfg.reactionType ?? 1));
-        return { success: true };
+        const reaction = resolveZaloWorkflowReaction(cfg.reactionType ?? 'LIKE');
+        if (!reaction) {
+          throw new Error('[zalo.addReaction] Reaction không hợp lệ');
+        }
+
+        const msgId = String(cfg.msgId || ctx.trigger?.msgId || '').trim();
+        // zca-js needs both the server message ID and the original client
+        // message ID. For received messages those two IDs may be different.
+        // Falling back to msgId makes the API accept the request in some cases,
+        // but Zalo then silently does not apply the reaction.
+        const configuredThreadId = String(cfg.threadId || '').trim();
+        const triggerThreadId = String(ctx.trigger?.threadId || '').trim();
+        const storedMessage = msgId
+          ? DatabaseService.getInstance().getMessageById(
+            ctx.trigger?.zaloId || ctx.pageId,
+            msgId,
+            configuredThreadId || triggerThreadId || undefined,
+          )
+          : undefined;
+        const threadId = configuredThreadId || triggerThreadId || String(storedMessage?.thread_id || '').trim();
+        const configuredThreadType = cfg.threadType !== undefined && cfg.threadType !== ''
+          ? cfg.threadType
+          : undefined;
+        const triggerThreadType = ctx.trigger?.threadType !== undefined && ctx.trigger?.threadType !== ''
+          ? ctx.trigger.threadType
+          : undefined;
+        const threadType = Number(configuredThreadType ?? triggerThreadType ?? storedMessage?.thread_type ?? 0) === 1 ? 1 : 0;
+        const cliMsgId = String(
+          cfg.clientMsgId || ctx.trigger?.cliMsgId || storedMessage?.cli_msg_id || msgId,
+        ).trim();
+        if (!msgId) throw new Error('[zalo.addReaction] Thiếu ID tin nhắn');
+        if (!threadId) throw new Error('[zalo.addReaction] Thiếu ID hội thoại');
+        if (!cliMsgId) throw new Error('[zalo.addReaction] Thiếu Client Message ID của tin nhắn');
+
+        await api.addReaction(reaction, {
+          data: {
+            msgId,
+            cliMsgId,
+          },
+          threadId,
+          type: threadType,
+        } as any);
+        return { success: true, msgId, cliMsgId, reaction };
       }
 
       case 'zalo.assignLabel': {
@@ -2172,83 +2243,11 @@ class WorkflowEngineService {
         messages.push({ role: 'user', content: cfg.prompt });
 
         const platform = cfg.platform || 'openai';
-        const rawModel = cfg.model || 'gpt-5.4-mini';
-        const model = this.normalizeModelName(rawModel);
+        const rawModel = cfg.model || '';
         const maxTokens = Number(cfg.maxTokens || 500);
         const temperature = Number(cfg.temperature ?? 0.7);
-
-        if (platform === 'gemini') {
-          // Google Gemini API
-          const geminiContents = this.openaiMessagesToGemini(messages);
-          const res = await axios.post(
-            `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${cfg.apiKey}`,
-            {
-              contents: geminiContents,
-              generationConfig: {
-                maxOutputTokens: maxTokens,
-                temperature,
-              },
-            },
-            { headers: { 'Content-Type': 'application/json' }, timeout: 60000 }
-          );
-          const result = res.data.candidates?.[0]?.content?.parts?.[0]?.text?.trim() || '';
-          const totalTokens = (res.data.usageMetadata?.promptTokenCount || 0) + (res.data.usageMetadata?.candidatesTokenCount || 0);
-          return { result, totalTokens, model };
-        } else if (platform === 'claude') {
-          // Anthropic Claude Messages API
-          const systemText = messages.filter(m => m.role === 'system').map(m => m.content).join('\n');
-          const claudeMessages = messages
-            .filter(m => m.role !== 'system')
-            .map(m => ({ role: m.role === 'assistant' ? 'assistant' as const : 'user' as const, content: m.content }));
-          const res = await axios.post(
-            'https://api.anthropic.com/v1/messages',
-            {
-              model,
-              max_tokens: maxTokens,
-              ...(systemText ? { system: systemText } : {}),
-              messages: claudeMessages,
-            },
-            {
-              headers: {
-                'x-api-key': cfg.apiKey,
-                'anthropic-version': '2023-06-01',
-                'Content-Type': 'application/json',
-              },
-              timeout: 60000,
-            }
-          );
-          const result = res.data.content?.[0]?.text?.trim() || '';
-          const totalTokens = (res.data.usage?.input_tokens || 0) + (res.data.usage?.output_tokens || 0);
-          return { result, totalTokens, model };
-        } else {
-          // OpenAI-compatible API (OpenAI, Deepseek, Grok/xAI, Mistral, OpenRouter)
-          const apiUrl = this.getOpenAICompatibleUrl(platform);
-          const tokenParam = platform === 'openai'
-            ? { max_completion_tokens: maxTokens }
-            : { max_tokens: maxTokens };
-          const res = await axios.post(
-            apiUrl,
-            {
-              model,
-              messages,
-              ...tokenParam,
-              temperature,
-            },
-            {
-              headers: {
-                Authorization: `Bearer ${cfg.apiKey}`,
-                'Content-Type': 'application/json',
-              },
-              timeout: 60000,
-            }
-          );
-          const result = res.data.choices?.[0]?.message?.content?.trim() || '';
-          return {
-            result,
-            totalTokens: res.data.usage?.total_tokens || 0,
-            model: res.data.model || model,
-          };
-        }
+        const response = await requestAICompletion({ platform, model: rawModel, apiKey: cfg.apiKey, messages, maxTokens, temperature });
+        return { result: response.result, totalTokens: response.totalTokens, model: response.model };
       }
 
       case 'ai.classify': {
@@ -2273,68 +2272,19 @@ class WorkflowEngineService {
         }
 
         const platform = cfg.platform || 'openai';
-        const model = this.normalizeModelName(cfg.model || 'gpt-5.4-mini');
         const classifyMessages = [
           { role: 'system' as const, content: systemMsg },
           { role: 'user' as const, content: cfg.input },
         ];
-
-        if (platform === 'gemini') {
-          const geminiContents = this.openaiMessagesToGemini(classifyMessages);
-          const res = await axios.post(
-            `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${cfg.apiKey}`,
-            {
-              contents: geminiContents,
-              generationConfig: { maxOutputTokens: 30, temperature: 0 },
-            },
-            { headers: { 'Content-Type': 'application/json' }, timeout: 15000 }
-          );
-          const category = res.data.candidates?.[0]?.content?.parts?.[0]?.text?.trim() || '';
-          return { category, input: cfg.input };
-        } else if (platform === 'claude') {
-          // Anthropic Claude Messages API
-          const claudeMessages = classifyMessages
-            .filter(m => m.role !== 'system')
-            .map(m => ({ role: 'user' as const, content: m.content }));
-          const res = await axios.post(
-            'https://api.anthropic.com/v1/messages',
-            {
-              model,
-              max_tokens: 30,
-              system: systemMsg,
-              messages: claudeMessages,
-            },
-            {
-              headers: {
-                'x-api-key': cfg.apiKey,
-                'anthropic-version': '2023-06-01',
-                'Content-Type': 'application/json',
-              },
-              timeout: 15000,
-            }
-          );
-          const category = res.data.content?.[0]?.text?.trim() || '';
-          return { category, input: cfg.input };
-        } else {
-          // OpenAI-compatible API (OpenAI, Deepseek, Grok/xAI, Mistral, OpenRouter)
-          const apiUrl = this.getOpenAICompatibleUrl(platform);
-          const tokenParam = platform === 'openai'
-            ? { max_completion_tokens: 30 }
-            : { max_tokens: 30 };
-          const res = await axios.post(
-            apiUrl,
-            { model, messages: classifyMessages, ...tokenParam, temperature: 0 },
-            {
-              headers: {
-                Authorization: `Bearer ${cfg.apiKey}`,
-                'Content-Type': 'application/json',
-              },
-              timeout: 15000,
-            }
-          );
-          const category = res.data.choices?.[0]?.message?.content?.trim() || '';
-          return { category, input: cfg.input };
-        }
+        const response = await requestAICompletion({
+          platform,
+          model: cfg.model || '',
+          apiKey: cfg.apiKey,
+          messages: classifyMessages,
+          maxTokens: 30,
+          temperature: 0,
+        });
+        return { category: response.result.trim(), input: cfg.input, model: response.model };
       }
 
       // ── Notify: Telegram ─────────────────────────────────────────────────
@@ -2356,9 +2306,13 @@ class WorkflowEngineService {
         if (!botToken) {
           return { success: false, error: 'Thiếu Bot Token. Hãy cấu hình Integration Telegram Bot trong Settings.' };
         }
+        const message = this.resolveMessageFromConfigOrUpstream(node, cfg, ctx, _wf);
+        if (!message.text) {
+          throw new Error('[notify.telegram] Nội dung thông báo đang trống. Nhập nội dung hoặc nối một node tạo văn bản ngay trước node này.');
+        }
         const payload: Record<string, any> = {
           chat_id: cfg.chatId,
-          text: cfg.message,
+          text: message.text,
         };
         if (cfg.parseMode) payload.parse_mode = cfg.parseMode;
         const res = await axios.post(
@@ -2369,6 +2323,7 @@ class WorkflowEngineService {
         return {
           success: true,
           messageId: res.data.result?.message_id || '',
+          contentSource: message.source,
         };
       }
 
@@ -3248,7 +3203,8 @@ class WorkflowEngineService {
         if (!botAccountId) throw new Error('[tgbot.action.sendMessage] accountId required');
         const chatId = cfg.chatId || ctx.trigger?.chatId;
         if (!chatId) throw new Error('[tgbot.action.sendMessage] chatId required');
-        const text = cfg.message || cfg.text || ctx.trigger?.content || '';
+        const resolvedMessage = this.resolveMessageFromConfigOrUpstream(node, cfg, ctx, _wf);
+        const text = resolvedMessage.text || ctx.trigger?.content || '';
         if (!text) throw new Error('[tgbot.action.sendMessage] message required');
 
         const TelegramBotChannel = require('../telegram/TelegramBotChannelService');
@@ -3259,7 +3215,7 @@ class WorkflowEngineService {
           text,
           replyMarkup,
         });
-        return { success: result?.success, messageId: result?.messageId };
+        return { success: result?.success, messageId: result?.messageId, contentSource: resolvedMessage.text ? resolvedMessage.source : 'trigger' };
       }
 
       case 'tgbot.action.sendPhoto': {
@@ -3905,6 +3861,52 @@ class WorkflowEngineService {
     return rendered;
   }
 
+  /**
+   * A text-format node is commonly connected directly to a notification node.
+   * Make that connection useful without requiring users to paste a node token
+   * into the message field. An explicit message (including a template that
+   * renders empty) remains authoritative, so a mistyped variable is not
+   * replaced with unrelated workflow data.
+   */
+  private resolveMessageFromConfigOrUpstream(
+    node: WorkflowNode,
+    cfg: Record<string, any>,
+    ctx: ExecutionContext,
+    wf: Workflow,
+  ): { text: string; source: 'config' | 'upstream' | 'none' } {
+    const configured = String(node.config?.message ?? node.config?.text ?? '').trim();
+    const rendered = String(cfg.message ?? cfg.text ?? '').trim();
+    if (configured || rendered) return { text: rendered, source: rendered ? 'config' : 'none' };
+
+    const directSources = wf.edges
+      .filter(edge => edge.target === node.id && !edge.data?.telegramInline)
+      .map(edge => edge.source);
+    for (const sourceId of directSources) {
+      const text = this.getTextOutput(ctx.nodes[sourceId]?.output);
+      if (text) return { text, source: 'upstream' };
+    }
+
+    // Legacy workflows can omit the visual edge while still execute in order.
+    // Only consider dedicated text-producing nodes to avoid sending a JSON
+    // object or an IF result by accident.
+    for (const sourceId of Object.keys(ctx.nodes).reverse()) {
+      const sourceNode = ctx._wfNodes?.find(candidate => candidate.id === sourceId);
+      if (!sourceNode || !['data.textFormat', 'data.randomPick', 'data.dateFormat', 'ai.generateText'].includes(sourceNode.type)) continue;
+      const text = this.getTextOutput(ctx.nodes[sourceId]?.output);
+      if (text) return { text, source: 'upstream' };
+    }
+    return { text: '', source: 'none' };
+  }
+
+  private getTextOutput(output: any): string {
+    if (typeof output === 'string') return output.trim();
+    if (!output || typeof output !== 'object') return '';
+    for (const key of ['result', 'text', 'message', 'content']) {
+      if (typeof output[key] === 'string' && output[key].trim()) return output[key].trim();
+    }
+    return '';
+  }
+
   private renderTemplate(template: string, ctx: ExecutionContext): string {
     return template.replace(/\{\{\s*([\s\S]*?)\s*\}\}/gu, (_, raw) => {
       try {
@@ -4043,20 +4045,6 @@ class WorkflowEngineService {
       default:           return 'https://api.openai.com/v1/chat/completions';
     }
   }
-
-  /** Normalize legacy/incorrect model names to current API model IDs */
-  private normalizeModelName(model: string): string {
-    const aliases: Record<string, string> = {
-      'deepseek-chat-v3.2':    'deepseek-v4-flash',
-      'deepseek-chat-v3.1':    'deepseek-v4-flash',
-      'deepseek-reasoner-r1.5':'deepseek-v4-pro',
-      'gemini-3.1-pro':        'gemini-3.1-pro-preview',
-      'gemini-3.1-flash':      'gemini-3.5-flash',
-      'gemini-3.0-flash':      'gemini-3-flash-preview',
-      'gemini-3.0-flash-lite': 'gemini-3-flash-preview',
-    };
-    return aliases[model] ?? model;
-}
 
   /** Convert OpenAI-format messages to Google Gemini format */
   private openaiMessagesToGemini(messages: Array<{ role: string; content: string }>): any[] {

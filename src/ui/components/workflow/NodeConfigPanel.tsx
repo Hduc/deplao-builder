@@ -5,6 +5,7 @@ import { useAccountStore } from '@/store/accountStore';
 import { useAppStore } from '@/store/appStore';
 import { Spinner } from '@/components/common/PageLoading';
 import { CHANNEL } from '@/lib/channelHelper';
+import { AI_MODEL_OPTIONS } from '../../../shared/aiModelCatalog';
 
 // ─── Webhook URL field component ─────────────────────────────────────
 function WebhookUrlField({ field, config, workflowId, update }: {
@@ -721,9 +722,9 @@ const CONFIG_SCHEMA: Record<string, Field[]> = {
       key: 'reactionType', label: 'Loại cảm xúc', type: 'select',
       desc: 'Cảm xúc sẽ được thêm vào tin nhắn.',
       options: [
-        { value: '1', label: 'Like' }, { value: '2', label: 'Yêu thích' },
-        { value: '3', label: 'Haha' }, { value: '4', label: 'Wow' },
-        { value: '5', label: 'Buồn' }, { value: '6', label: 'Giận' },
+        { value: 'LIKE', label: '👍 Like' }, { value: 'HEART', label: '❤️ Yêu thích' },
+        { value: 'HAHA', label: '😆 Haha' }, { value: 'WOW', label: '😮 Wow' },
+        { value: 'CRY', label: '😢 Buồn' }, { value: 'ANGRY', label: '😡 Giận' },
       ],
     },
     {
@@ -731,6 +732,23 @@ const CONFIG_SCHEMA: Record<string, Field[]> = {
       placeholder: '{{ $trigger.msgId }}',
       desc: 'ID tin nhắn muốn thêm cảm xúc.',
       templateVars: ['$trigger.msgId'], advanced: true,
+    },
+    {
+      key: 'clientMsgId', label: 'Client Message ID', type: 'text',
+      placeholder: '{{ $trigger.cliMsgId }}',
+      desc: 'Dùng ID gốc của tin nhắn. Hệ thống tự lấy khi workflow được kích hoạt từ tin nhắn Zalo.',
+      templateVars: ['$trigger.cliMsgId'], advanced: true,
+    },
+    {
+      key: 'threadId', label: 'Hội thoại chứa tin nhắn', type: 'contact-picker', contactType: 'all',
+      placeholder: '{{ $trigger.threadId }}',
+      desc: 'Cần để Zalo xác định tin nhắn thuộc hội thoại nào.',
+      templateVars: ['$trigger.threadId'], advanced: true,
+    },
+    {
+      key: 'threadType', label: 'Loại hội thoại', type: 'select',
+      options: [{ value: '0', label: 'Cá nhân' }, { value: '1', label: 'Nhóm' }],
+      placeholder: '{{ $trigger.threadType }}', advanced: true,
     },
   ],
   'zalo.assignLabel': [
@@ -1097,6 +1115,9 @@ const CONFIG_SCHEMA: Record<string, Field[]> = {
       desc: 'Chọn model phù hợp với nền tảng đã chọn ở trên.',
       options: [
         // OpenAI
+        { value: 'gpt-6-astra',      label: 'GPT-6 Astra - Reasoning, công việc phức tạp (OpenAI)' },
+        { value: 'gpt-6.1-sol',      label: 'GPT-6.1 Sol - Cân bằng tốc độ, chất lượng (OpenAI)' },
+        { value: 'gpt-6-luna',       label: 'GPT-6 Luna - Nhanh, tiết kiệm (OpenAI)' },
         { value: 'gpt-5.4',          label: 'GPT-5.4 - Flagship mới nhất (OpenAI)' },
         { value: 'gpt-5.4-pro',      label: 'GPT-5.4 Pro - Thông minh nhất (OpenAI)' },
         { value: 'gpt-5.4-mini',     label: 'GPT-5.4 Mini - Code, subagent (OpenAI - khuyến nghị)' },
@@ -1113,13 +1134,17 @@ const CONFIG_SCHEMA: Record<string, Field[]> = {
         { value: 'gemini-3-flash-preview',  label: 'Gemini 3 Flash Preview - Nhanh (Google)' },
         { value: 'gemini-2.5-pro',          label: 'Gemini 2.5 Pro - Legacy ổn định (Google)' },
         // Claude (Anthropic)
+        { value: 'claude-fable-5-1',          label: 'Claude Fable 5.1 - Reasoning dài hạn (Anthropic)' },
+        { value: 'claude-opus-5-5',           label: 'Claude Opus 5.5 - Agentic, knowledge work (Anthropic)' },
+        { value: 'claude-sonnet-5-5',         label: 'Claude Sonnet 5.5 - Cân bằng (Anthropic)' },
+        { value: 'claude-haiku-4-5-20251001', label: 'Claude Haiku 4.5 - Nhanh (Anthropic)' },
         { value: 'claude-4.6-sonnet-20260301',  label: 'Claude 4.6 Sonnet - Mới nhất (Anthropic - khuyến nghị)' },
         { value: 'claude-4.5-sonnet-20260115',  label: 'Claude 4.5 Sonnet - Cân bằng (Anthropic)' },
         { value: 'claude-4.0-haiku-20260101',   label: 'Claude 4.0 Haiku - Nhanh, rẻ (Anthropic)' },
         { value: 'claude-4.0-opus-20260101',    label: 'Claude 4.0 Opus - Mạnh nhất gen 4 (Anthropic)' },
         { value: 'claude-sonnet-4-20250514',    label: 'Claude Sonnet 4 - Legacy (Anthropic)' },
         // Deepseek
-        { value: 'deepseek-v4-flash',  label: 'Deepseek V4 Flash - Mới nhất (Deepseek - khuyến nghị)' },
+        { value: 'deepseek-flash',     label: 'Deepseek Flash - Mới nhất (Deepseek - khuyến nghị)' },
         { value: 'deepseek-v4-pro',    label: 'Deepseek V4 Pro - Thinking, mạnh nhất (Deepseek)' },
         { value: 'deepseek-reasoner',  label: 'Deepseek R1 - Lý luận ổn định (Deepseek)' },
         // Grok
@@ -1145,10 +1170,10 @@ const CONFIG_SCHEMA: Record<string, Field[]> = {
         { value: 'mistralai/mistral-large-2',   label: 'Mistral Large 2 (OpenRouter)' },
       ],
       optionsFilter: { key: 'platform', map: {
-        openai:   ['gpt-5.4', 'gpt-5.4-pro', 'gpt-5.4-mini', 'gpt-5.4-nano', 'gpt-5-mini', 'gpt-5-nano', 'gpt-5', 'o4-mini', 'o3', 'gpt-4.1'],
+        openai:   ['gpt-6-astra', 'gpt-6.1-sol', 'gpt-6-luna', 'gpt-5.4', 'gpt-5.4-pro', 'gpt-5.4-mini', 'gpt-5.4-nano', 'gpt-5-mini', 'gpt-5-nano', 'gpt-5', 'o4-mini', 'o3', 'gpt-4.1'],
         gemini:   ['gemini-3.5-flash', 'gemini-3.1-pro-preview', 'gemini-3-flash-preview', 'gemini-2.5-pro'],
-        claude:   ['claude-4.6-sonnet-20260301', 'claude-4.5-sonnet-20260115', 'claude-4.0-haiku-20260101', 'claude-4.0-opus-20260101', 'claude-sonnet-4-20250514'],
-        deepseek: ['deepseek-v4-flash', 'deepseek-v4-pro', 'deepseek-reasoner'],
+        claude:   ['claude-fable-5-1', 'claude-opus-5-5', 'claude-sonnet-5-5', 'claude-haiku-4-5-20251001', 'claude-4.6-sonnet-20260301', 'claude-4.5-sonnet-20260115', 'claude-4.0-haiku-20260101', 'claude-4.0-opus-20260101', 'claude-sonnet-4-20250514'],
+        deepseek: ['deepseek-flash', 'deepseek-v4-pro', 'deepseek-reasoner'],
         grok:     ['grok-4-fast', 'grok-4', 'grok-4-mini', 'grok-4-mini-fast', 'grok-3'],
         mistral:  ['mistral-large-2-latest', 'codestral-2-latest', 'mistral-small-3-latest', 'mistral-medium-latest', 'open-mistral-nemo-2'],
         openrouter: ['openrouter/auto', 'openai/gpt-5.4-mini', 'anthropic/claude-4.6-sonnet', 'google/gemini-3.5-flash', 'deepseek/deepseek-v4-flash', 'meta-llama/llama-4-maverick', 'qwen/qwen3-max', 'mistralai/mistral-large-2'],
@@ -1248,15 +1273,22 @@ const CONFIG_SCHEMA: Record<string, Field[]> = {
       key: 'model', label: 'Model AI', type: 'select',
       desc: 'Chọn model phù hợp với nền tảng đã chọn ở trên.',
       options: [
+        { value: 'gpt-6-astra',      label: 'GPT-6 Astra - Reasoning, công việc phức tạp (OpenAI)' },
+        { value: 'gpt-6.1-sol',      label: 'GPT-6.1 Sol - Cân bằng tốc độ, chất lượng (OpenAI)' },
+        { value: 'gpt-6-luna',       label: 'GPT-6 Luna - Nhanh, tiết kiệm (OpenAI)' },
         { value: 'gpt-5.4-mini',     label: 'GPT-5.4 Mini - Code, subagent (OpenAI - khuyến nghị)' },
         { value: 'gpt-5-mini',       label: 'GPT-5 Mini - Cân bằng, giá tốt (OpenAI)' },
         { value: 'gpt-5.4',          label: 'GPT-5.4 - Flagship (OpenAI)' },
         { value: 'gemini-3.5-flash',        label: 'Gemini 3.5 Flash (Google - khuyến nghị)' },
         { value: 'gemini-3.1-pro-preview',  label: 'Gemini 3.1 Pro Preview (Google)' },
         { value: 'gemini-3-flash-preview',  label: 'Gemini 3 Flash Preview (Google)' },
+        { value: 'claude-fable-5-1',          label: 'Claude Fable 5.1 - Reasoning dài hạn (Anthropic)' },
+        { value: 'claude-opus-5-5',           label: 'Claude Opus 5.5 - Agentic, knowledge work (Anthropic)' },
+        { value: 'claude-sonnet-5-5',         label: 'Claude Sonnet 5.5 - Cân bằng (Anthropic)' },
+        { value: 'claude-haiku-4-5-20251001', label: 'Claude Haiku 4.5 - Nhanh (Anthropic)' },
         { value: 'claude-4.6-sonnet-20260301',  label: 'Claude 4.6 Sonnet (Anthropic - khuyến nghị)' },
         { value: 'claude-4.0-haiku-20260101',   label: 'Claude 4.0 Haiku - Nhanh (Anthropic)' },
-        { value: 'deepseek-v4-flash',  label: 'Deepseek V4 Flash (Deepseek - khuyến nghị)' },
+        { value: 'deepseek-flash',     label: 'Deepseek Flash (Deepseek - khuyến nghị)' },
         { value: 'deepseek-v4-pro',    label: 'Deepseek V4 Pro - Thinking (Deepseek)' },
         { value: 'grok-4-fast',      label: 'Grok 4 Fast (xAI - khuyến nghị)' },
         { value: 'grok-4-mini-fast', label: 'Grok 4 Mini Fast - Siêu nhanh (xAI)' },
@@ -1266,10 +1298,10 @@ const CONFIG_SCHEMA: Record<string, Field[]> = {
         { value: 'deepseek/deepseek-v4-flash', label: 'DeepSeek V4 Flash - Rẻ, nhanh (OpenRouter)' },
       ],
       optionsFilter: { key: 'platform', map: {
-        openai:   ['gpt-5.4-mini', 'gpt-5-mini', 'gpt-5.4'],
+        openai:   ['gpt-6-astra', 'gpt-6.1-sol', 'gpt-6-luna', 'gpt-5.4-mini', 'gpt-5-mini', 'gpt-5.4'],
         gemini:   ['gemini-3.5-flash', 'gemini-3.1-pro-preview', 'gemini-3-flash-preview'],
-        claude:   ['claude-4.6-sonnet-20260301', 'claude-4.0-haiku-20260101'],
-        deepseek: ['deepseek-v4-flash', 'deepseek-v4-pro'],
+        claude:   ['claude-fable-5-1', 'claude-opus-5-5', 'claude-sonnet-5-5', 'claude-haiku-4-5-20251001', 'claude-4.6-sonnet-20260301', 'claude-4.0-haiku-20260101'],
+        deepseek: ['deepseek-flash', 'deepseek-v4-pro'],
         grok:     ['grok-4-fast', 'grok-4-mini-fast'],
         mistral:  ['mistral-large-2-latest', 'mistral-small-3-latest'],
         openrouter: ['openrouter/auto', 'deepseek/deepseek-v4-flash'],
@@ -1299,7 +1331,7 @@ const CONFIG_SCHEMA: Record<string, Field[]> = {
     {
       key: 'message', label: 'Nội dung thông báo', type: 'textarea',
       placeholder: '🔔 Tin nhắn mới từ {{ $trigger.fromName }}:\n{{ $trigger.content }}',
-      desc: 'Nội dung tin nhắn gửi qua Telegram. Hỗ trợ HTML đơn giản (<b>bold</b>, <i>italic</i>).',
+      desc: 'Nội dung tin nhắn gửi qua Telegram. Để trống sẽ dùng kết quả văn bản từ node phía trước. Hỗ trợ HTML đơn giản (<b>bold</b>, <i>italic</i>).',
       templateVars: ['$trigger.fromName', '$trigger.content', '$trigger.fromId', '$date.now'],
     },
     {
@@ -2490,6 +2522,22 @@ const CONFIG_SCHEMA: Record<string, Field[]> = {
     { key: 'title', label: 'Tên topic', type: 'text', placeholder: 'Tên topic mới' },
   ],
 };
+
+// The inline arrays above are retained to read old workflow definitions. The
+// editor itself only offers current provider model IDs from the shared catalog.
+const CURRENT_AI_MODEL_OPTIONS = Object.entries(AI_MODEL_OPTIONS)
+  .filter(([platform]) => platform !== '9router')
+  .flatMap(([, options]) => options);
+const CURRENT_AI_MODEL_FILTER = Object.fromEntries(
+  Object.entries(AI_MODEL_OPTIONS).map(([platform, options]) => [platform, options.map(option => option.value)]),
+);
+for (const nodeType of ['ai.generateText', 'ai.classify']) {
+  const modelField = CONFIG_SCHEMA[nodeType]?.find(field => field.key === 'model');
+  if (modelField) {
+    modelField.options = CURRENT_AI_MODEL_OPTIONS;
+    modelField.optionsFilter = { key: 'platform', map: CURRENT_AI_MODEL_FILTER };
+  }
+}
 
 // ─── Props ────────────────────────────────────────────────────────────────────
 
@@ -4460,6 +4508,7 @@ export default function NodeConfigPanel({ node, nodes, edges, onConfigChange, on
   const [showTemplatePopup, setShowTemplatePopup] = useState(false);
   const [templatePopupField, setTemplatePopupField] = useState<string>('');
   const [copiedNodeId, setCopiedNodeId] = useState<string | null>(null);
+  const [isUpstreamNodesCollapsed, setIsUpstreamNodesCollapsed] = useState(true);
   const isResizingRef = useRef(false);
   const resizeStartXRef  = useRef(0);
   const resizeStartWRef  = useRef(320);
@@ -5047,39 +5096,66 @@ export default function NodeConfigPanel({ node, nodes, edges, onConfigChange, on
       {/* ── Node references ── */}
       {upstreamNodes.length > 0 && (
         <div className="bg-gray-800/60 rounded-xl px-3 py-2">
-          <p className="text-[11px] text-gray-400 font-medium mb-1.5">Dữ liệu từ node phía trước</p>
-          <div className="flex flex-col gap-1.5">
-            {upstreamNodes.map(n => {
-              const copied = copiedNodeId === n.id;
-              return (
-                <div key={n.id} className="flex items-center gap-1.5">
-                  <button
-                    type="button"
-                    onClick={() => {
-                      navigator.clipboard.writeText(`{{ $node.${n.id}.output }}`).catch(()=>{});
-                      setCopiedNodeId(n.id);
-                      setTimeout(() => setCopiedNodeId(null), 1000);
-                    }}
-                    className={`flex-1 flex items-center gap-2 text-[10px] font-mono px-2.5 py-1.5 rounded-lg transition-all truncate ${
-                      copied
-                        ? 'bg-green-500/20 text-green-400 border border-green-500/40'
-                        : 'bg-cyan-500/10 text-cyan-400 border border-cyan-500/20 hover:bg-cyan-500/20 hover:border-cyan-500/40'
-                    }`}
-                  >
-                    {copied ? (
-                      <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3" className="flex-shrink-0"><polyline points="20 6 9 17 4 12"/></svg>
-                    ) : (
-                      <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" className="flex-shrink-0">
-                        <rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/>
-                      </svg>
-                    )}
-                    <span className="truncate">{n.label}</span>
-                  </button>
-                </div>
-              );
-            })}
-          </div>
-          <p className="text-[9px] text-gray-400 mt-1">Click để copy <span className="font-mono text-gray-400">{'{{ $node.<UUID>.output }}'}</span></p>
+          <button
+            type="button"
+            onClick={() => setIsUpstreamNodesCollapsed(collapsed => !collapsed)}
+            aria-expanded={!isUpstreamNodesCollapsed}
+            className="w-full flex items-center justify-between gap-2 text-left text-[11px] text-gray-400 font-medium hover:text-gray-300 transition-colors"
+            title={isUpstreamNodesCollapsed ? 'Mở dữ liệu từ node phía trước' : 'Thu gọn dữ liệu từ node phía trước'}
+          >
+            <span className="flex items-center gap-1.5 min-w-0">
+              <span className="truncate">Dữ liệu từ node phía trước</span>
+              <span className="text-[10px] text-gray-500">({upstreamNodes.length})</span>
+            </span>
+            <svg
+              width="14"
+              height="14"
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="2.5"
+              className={`flex-shrink-0 transition-transform ${isUpstreamNodesCollapsed ? '' : 'rotate-180'}`}
+              aria-hidden="true"
+            >
+              <polyline points="6 9 12 15 18 9" />
+            </svg>
+          </button>
+          {!isUpstreamNodesCollapsed && (
+            <>
+              <div className="flex flex-col gap-1.5 mt-1.5">
+                {upstreamNodes.map(n => {
+                  const copied = copiedNodeId === n.id;
+                  return (
+                    <div key={n.id} className="flex items-center gap-1.5">
+                      <button
+                        type="button"
+                        onClick={() => {
+                          navigator.clipboard.writeText(`{{ $node.${n.id}.output }}`).catch(()=>{});
+                          setCopiedNodeId(n.id);
+                          setTimeout(() => setCopiedNodeId(null), 1000);
+                        }}
+                        className={`flex-1 flex items-center gap-2 text-[10px] font-mono px-2.5 py-1.5 rounded-lg transition-all truncate ${
+                          copied
+                            ? 'bg-green-500/20 text-green-400 border border-green-500/40'
+                            : 'bg-cyan-500/10 text-cyan-400 border border-cyan-500/20 hover:bg-cyan-500/20 hover:border-cyan-500/40'
+                        }`}
+                      >
+                        {copied ? (
+                          <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3" className="flex-shrink-0"><polyline points="20 6 9 17 4 12"/></svg>
+                        ) : (
+                          <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" className="flex-shrink-0">
+                            <rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/>
+                          </svg>
+                        )}
+                        <span className="truncate">{n.label}</span>
+                      </button>
+                    </div>
+                  );
+                })}
+              </div>
+              <p className="text-[9px] text-gray-400 mt-1">Click để copy <span className="font-mono text-gray-400">{'{{ $node.<UUID>.output }}'}</span></p>
+            </>
+          )}
         </div>
       )}
 

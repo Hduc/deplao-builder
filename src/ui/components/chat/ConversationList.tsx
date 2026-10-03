@@ -24,7 +24,7 @@ import { getCapability, channelSupports, getChannelLabel, type Channel } from '@
 import { extractUserProfile } from '../../../utils/profileUtils';
 import { refreshContactAlias } from '../../hooks/useZaloEvents';
 import PageLoading from '@/components/common/PageLoading';
-import { CHANNEL, isZalo, isNonZalo, isTelegram, isTelegramUser } from '@/lib/channelHelper';
+import { CHANNEL, isFacebook, isZalo, isNonZalo, isTelegram, isTelegramUser } from '@/lib/channelHelper';
 import { getAdapter } from '@/lib/adapters/registry';
 import ForumTopicsPanel from './ForumTopicsPanel';
 
@@ -390,7 +390,11 @@ export default function ConversationList() {
     if (currentContacts.length > 0) {
       setConversationNextOffset(currentContacts.length);
       setConversationHasMore(currentContacts.length >= PAGE_SIZE && !conversationExhausted);
-      if (conversationExhausted || !isEmp || currentContacts.length >= PAGE_SIZE) return;
+      // A Telegram event can create one in-memory contact before the initial
+      // database hydration runs. Do not treat that partial cache as a complete
+      // standalone inbox, otherwise the remaining saved conversations never
+      // reach the list after an app restart.
+      if (conversationExhausted || currentContacts.length >= PAGE_SIZE) return;
     }
     if (useChatStore.getState().conversationsLoading[activeAccountId]) return;
 
@@ -1480,6 +1484,26 @@ export default function ConversationList() {
                 }
               } catch (tgErr) {
                 console.warn(`[ConversationList] Telegram getMessages fallback error:`, tgErr);
+              }
+            } else if (isFacebook(accChannel)) {
+              // The initial Facebook refresh persists bridge history. This
+              // fallback covers a thread opened before that background sync
+              // reaches it; regular chats are available through GraphQL.
+              try {
+                const fbRes = await ipc.fb?.fetchThreadMessages({
+                  accountId: zaloId!, threadId: contactId, limit: MESSAGE_LOAD_LIMIT,
+                });
+                if (fbRes?.success) {
+                  const refreshed = await DataAccessor.getMessages({
+                    zaloId: zaloId!, threadId: contactId, limit: MESSAGE_LOAD_LIMIT,
+                  });
+                  const refreshedMessages = refreshed?.messages || refreshed?.items || [];
+                  if (refreshedMessages.length > 0) {
+                    setMessages(zaloId!, contactId, [...refreshedMessages].reverse());
+                  }
+                }
+              } catch (fbErr) {
+                console.warn(`[ConversationList] Facebook history fallback error:`, fbErr);
               }
             }
           }

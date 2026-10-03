@@ -746,15 +746,24 @@ class ZaloLoginHelper {
                 }
 
                 message.zaloId = zaloId;
-                await EventBroadcaster.broadcastMessage(zaloId, message);
 
-                // ─── For group messages: fetch group info in background if not cached ─
+                // A workflow is started by broadcastMessage. Resolve the group name
+                // first so $trigger.groupName is available during that same run,
+                // rather than only on the next message after a background refresh.
                 if (message.type === 1) {
                     const groupId = message.threadId || '';
                     if (groupId) {
-                        ZaloLoginHelper.fetchGroupInfoIfMissing(zaloId, groupId, connection.api);
+                        await ZaloLoginHelper.fetchGroupInfoIfMissing(zaloId, groupId, connection.api);
+                        let cachedGroupName = '';
+                        EventBroadcaster.runOnBossDb((bossDb) => {
+                            cachedGroupName = String(bossDb.getContactById(zaloId, groupId)?.display_name || '');
+                        });
+                        if (cachedGroupName && cachedGroupName !== groupId && !/^\d+$/.test(cachedGroupName)) {
+                            message.groupName = cachedGroupName;
+                        }
                     }
                 }
+                await EventBroadcaster.broadcastMessage(zaloId, message);
             } catch (error: any) {
                 Logger.error(`[ZaloLoginHelper] message event error: ${error.message}`);
             }

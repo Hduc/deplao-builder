@@ -224,8 +224,8 @@ export function registerCRMIpc(): void {
     });
 
     // ─── Analytics / Reporting ─────────────────────────────────────────────────
-    ipcMain.handle('analytics:dashboardOverview', async (_e, { zaloId }: { zaloId: string }) => {
-        try { return { success: true, ...DatabaseService.getInstance().getDashboardOverview(zaloId) }; }
+    ipcMain.handle('analytics:dashboardOverview', async (_e, { zaloId, sinceTs, untilTs, threadType }: { zaloId: string; sinceTs?: number; untilTs?: number; threadType?: number }) => {
+        try { return { success: true, ...DatabaseService.getInstance().getDashboardOverview(zaloId, sinceTs, untilTs, threadType) }; }
         catch (e: any) { return { success: false, error: e.message }; }
     });
 

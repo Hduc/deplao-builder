@@ -13,7 +13,9 @@
     "skipLibCheck": true,
     "noEmit": false,
     "declaration": false,
-    "sourceMap": true
+    "sourceMap": true,
+    "incremental": true,
+    "tsBuildInfoFile": "./tmp/tsconfig.electron.tsbuildinfo"
   },
   "include": [
     "electron/**/*",

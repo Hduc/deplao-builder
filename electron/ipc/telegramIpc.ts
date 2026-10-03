@@ -64,6 +64,7 @@ export function registerTelegramIpc(): void {
     text: string;
     parseMode?: string;
     replyMarkup?: Record<string, any>;
+    mentions?: Array<{ uid: string; pos: number; len: number }>;
   }) => {
     try {
       return await TelegramBotChannel.sendMessage(params);

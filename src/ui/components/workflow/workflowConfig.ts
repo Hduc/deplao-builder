@@ -295,7 +295,13 @@ export const DEFAULT_CONFIGS: Record<string, Record<string, any>> = {
   'zalo.undoMessage':      { msgId: '', threadId: '{{ $trigger.threadId }}', threadType: '{{ $trigger.threadType }}' },
   'zalo.createPoll':       { groupId: '', question: '', options: 'Có\nKhông', allowMultiple: false, expireTime: 0 },
   'zalo.getMessageHistory':{ threadId: '{{ $trigger.threadId }}', count: 20 },
-  'zalo.addReaction':      { msgId: '{{ $trigger.msgId }}', reactionType: '1' },
+  'zalo.addReaction':      {
+    msgId: '{{ $trigger.msgId }}',
+    clientMsgId: '{{ $trigger.cliMsgId }}',
+    threadId: '{{ $trigger.threadId }}',
+    threadType: '{{ $trigger.threadType }}',
+    reactionType: 'LIKE',
+  },
   // Quản lý nhãn
   'zalo.assignLabel':      { threadId: '{{ $trigger.threadId }}', labelSource: 'local', labelIds: [] },
   'zalo.removeLabel':      { threadId: '{{ $trigger.threadId }}', labelSource: 'local', labelIds: [] },
@@ -317,8 +323,8 @@ export const DEFAULT_CONFIGS: Record<string, Record<string, any>> = {
   'sheets.readValues':  { spreadsheetId: '', range: 'Sheet1!A1:Z100', serviceAccountPath: '' },
   'sheets.updateCell':  { spreadsheetId: '', range: 'Sheet1!A1', value: '', serviceAccountPath: '' },
   // AI
-  'ai.generateText': { aiConfigMode: 'assistant', assistantId: '', platform: 'openai', apiKey: '', model: 'gpt-5.4-mini', systemPrompt: 'Bạn là trợ lý tư vấn bán hàng chuyên nghiệp.', prompt: '{{ $trigger.content }}', maxTokens: 300, temperature: 0.7 },
-  'ai.classify':     { aiConfigMode: 'assistant', assistantId: '', platform: 'openai', apiKey: '', model: 'gpt-5.4-mini', categories: 'hỏi giá, đặt hàng, khiếu nại, khác', input: '{{ $trigger.content }}' },
+  'ai.generateText': { aiConfigMode: 'assistant', assistantId: '', platform: 'openai', apiKey: '', model: 'gpt-5.6-luna', systemPrompt: 'Bạn là trợ lý tư vấn bán hàng chuyên nghiệp.', prompt: '{{ $trigger.content }}', maxTokens: 300, temperature: 0.7 },
+  'ai.classify':     { aiConfigMode: 'assistant', assistantId: '', platform: 'openai', apiKey: '', model: 'gpt-5.6-luna', categories: 'hỏi giá, đặt hàng, khiếu nại, khác', input: '{{ $trigger.content }}' },
   // Notify
   'notify.telegram': { botToken: '', chatId: '', message: '' },
   'notify.discord':  { webhookUrl: '', message: '', username: 'DepLao Bot' },

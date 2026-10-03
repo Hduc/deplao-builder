@@ -73,15 +73,14 @@ export function registerDatabaseIpc() {
                 Logger.warn(`[databaseIpc] db:getMessages BLOCKED by employee mode (activeWs=${WorkspaceManager.getInstance().getActiveWorkspace()?.type || 'none'})`);
                 return { success: true };
             }
-            Logger.log(`[databaseIpc] db:getMessages zaloId=${zaloId} threadId=${threadId} limit=${limit} offset=${offset} before=${before}`);
-            const messages = DatabaseService.getInstance().getMessages(zaloId, threadId, limit, offset, before > 0 ? before : undefined, topicId);
-            // Log chi tiết 3 tin nhắn đầu để debug attachment/local_paths
-            const sample = messages.slice(0, 3).map((m: any) => {
-                const attLen = m.attachments ? String(m.attachments).length : 0;
-                const hasLp = !!(m.local_paths && m.local_paths !== '{}' && m.local_paths !== '[]');
-                return `{ id=${m.msg_id} type=${m.msg_type} att=${attLen}b lp=${hasLp} sent=${m.is_sent} ch=${m.channel} }`;
-            });
-            Logger.log(`[databaseIpc] db:getMessages → ${messages.length} msgs. Sample: ${sample.join(' | ')}`);
+            // Renderer input is not a safe pagination boundary.  A malformed or
+            // legacy caller must not serialize an entire multi-million-row thread
+            // over IPC and freeze both Electron processes.
+            const safeLimit = Math.min(Math.max(Math.floor(Number(limit) || 50), 1), 200);
+            const safeOffset = Math.max(Math.floor(Number(offset) || 0), 0);
+            const safeBefore = Math.max(Math.floor(Number(before) || 0), 0);
+            const messages = DatabaseService.getInstance().getMessages(zaloId, threadId, safeLimit, safeOffset, safeBefore || undefined, topicId);
+            Logger.log(`[databaseIpc] db:getMessages → ${messages.length} msgs (limit=${safeLimit}, cursor=${safeBefore || '-'}, offset=${safeOffset})`);
             return { success: true, messages };
         } catch (error: any) {
             return { success: false, error: error.message };
@@ -118,7 +117,7 @@ export function registerDatabaseIpc() {
         }
     });
 
-    ipcMain.handle('db:getContactsFiltered', async (_event, params: { zaloId: string; channel?: string; search?: string; othersOnly?: boolean; excludeOthers?: boolean; unreadOnly?: boolean; limit?: number }) => {
+    ipcMain.handle('db:getContactsFiltered', async (_event, params: { zaloId: string; channel?: string; search?: string; othersOnly?: boolean; excludeOthers?: boolean; unreadOnly?: boolean; limit?: number; offset?: number }) => {
         try {
             if (isEmployeeMode()) return { success: true, contacts: [] };
             const contacts = DatabaseService.getInstance().getContactsFiltered(params.zaloId, params);

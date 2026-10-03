@@ -38,7 +38,9 @@ export interface FBAccountInitOptions {
 
 // ── LocalStorage persistence ──────────────────────────────────────────────────
 
-const FB_SYNC_VERSION = 4; // Bumped: fix owner_zalo_id using facebook_id instead of UUID
+// Re-run inbox synchronization once: older clients replayed E2EE history as
+// live traffic and left stale unread badges in the local contact cache.
+const FB_SYNC_VERSION = 5;
 
 interface FBInitRecord {
   version: number;

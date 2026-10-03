@@ -1981,56 +1981,199 @@ function TelegramGroupMembersTab({ channel }: { channel: 'telegram_user' | 'tele
     return text.includes(memberQuery.toLowerCase());
   });
   const allVisibleSelected = visibleMembers.length > 0 && visibleMembers.every(member => selectedMemberIds.has(member.id));
+  const selectedGroup = groups.find(g => g.contact_id === selectedId);
   return (
     <div className="flex flex-1 min-h-0 overflow-hidden">
-      <aside className="w-80 flex-shrink-0 border-r border-gray-700 flex flex-col">
-        <div className="p-3 border-b border-gray-700 flex gap-2">
-          <input value={query} onChange={e => setQuery(e.target.value)} placeholder="Tìm nhóm Telegram..."
-            className="flex-1 bg-gray-800 border border-gray-600 rounded-lg px-2.5 py-2 text-xs text-gray-200 focus:outline-none focus:border-blue-500" />
-          <button onClick={refreshGroupsAndMissingAvatars} disabled={loading || refreshingGroups} title="Tải lại nhóm và avatar còn thiếu" className="px-2 text-xs text-blue-400 hover:text-blue-300 disabled:opacity-50">{refreshingGroups ? '…' : '↻'}</button>
+      {/* ── Left: Groups ──────────────────────────────────────────────────── */}
+      <aside className="w-80 flex-shrink-0 border-r border-gray-700 flex flex-col bg-gray-900/40">
+        <div className="px-4 pt-4 pb-3 border-b border-gray-700 flex items-start gap-2 flex-shrink-0">
+          <div className="flex-1 min-w-0">
+            <h3 className="text-sm font-semibold text-white">Danh sách nhóm</h3>
+            <p className="text-[11px] text-gray-400 mt-0.5">
+              {groups.length > 0 ? `${groups.length} nhóm Telegram đã đồng bộ` : 'Nhóm Telegram đã đồng bộ'}
+            </p>
+          </div>
+          <button onClick={refreshGroupsAndMissingAvatars} disabled={loading || refreshingGroups}
+            title="Tải lại nhóm và avatar còn thiếu"
+            className="flex items-center justify-center w-8 h-8 rounded-lg border border-gray-600 text-gray-300 hover:text-white hover:border-gray-500 hover:bg-gray-800 disabled:opacity-50 transition-colors flex-shrink-0">
+            {loading || refreshingGroups ? SpinIcon : RefreshIcon}
+          </button>
         </div>
-        <div className="flex-1 overflow-y-auto divide-y divide-gray-700/70">
-          {visibleGroups.map(g => <button key={g.contact_id} onClick={() => selectGroup(g.contact_id)}
-            className={`w-full text-left px-3 py-3 flex items-center gap-2 hover:bg-gray-800/70 ${selectedId === g.contact_id ? 'bg-blue-500/10' : ''}`}>
-            <Avatar src={g.avatar_url || g.avatar} name={g.display_name || g.contact_id} size={32} />
-            <span className="min-w-0 flex-1 text-xs text-gray-200 truncate">{g.display_name || g.contact_id}</span>
-          </button>)}
-          {!loading && visibleGroups.length === 0 && <p className="p-5 text-center text-xs text-gray-400">Chưa có nhóm Telegram đã đồng bộ.</p>}
+
+        <div className="px-3 py-2.5 border-b border-gray-700/60 flex-shrink-0">
+          <div className="relative">
+            <svg className="absolute left-2.5 top-1/2 -translate-y-1/2 text-gray-400" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+              <circle cx="11" cy="11" r="7"/><path d="M21 21l-4.35-4.35"/>
+            </svg>
+            <input value={query} onChange={e => setQuery(e.target.value)} placeholder="Tìm nhóm Telegram..."
+              className="w-full bg-gray-800 border border-gray-600 rounded-lg pl-8 pr-3 py-2 text-xs text-gray-200 placeholder-gray-500 focus:outline-none focus:border-blue-500 transition-colors" />
+          </div>
+        </div>
+
+        <div className="flex-1 overflow-y-auto px-2 py-2 space-y-1">
+          {visibleGroups.map(g => {
+            const active = selectedId === g.contact_id;
+            return (
+              <button key={g.contact_id} onClick={() => selectGroup(g.contact_id)}
+                className={`w-full text-left px-2.5 py-2 rounded-xl flex items-center gap-2.5 transition-colors border
+                  ${active ? 'bg-blue-500/15 border-blue-500/40' : 'border-transparent hover:bg-gray-800/70'}`}>
+                <Avatar src={g.avatar_url || g.avatar} name={g.display_name || g.contact_id} size={34} />
+                <span className="min-w-0 flex-1">
+                  <span className={`block text-xs truncate font-medium ${active ? 'text-white' : 'text-gray-200'}`}>
+                    {g.display_name || g.contact_id}
+                  </span>
+                  <span className="block text-[10px] text-gray-400 mt-0.5 truncate">
+                    {g.telegram_peer_type === 'forum' ? 'Diễn đàn'
+                      : g.telegram_peer_type === 'supergroup' ? 'Siêu nhóm'
+                      : g.telegram_peer_type === 'basic_group' ? 'Nhóm'
+                      : 'Nhóm Telegram'}
+                  </span>
+                </span>
+              </button>
+            );
+          })}
+          {!loading && visibleGroups.length === 0 && (
+            <p className="p-5 text-center text-xs text-gray-400 leading-relaxed">
+              Chưa có nhóm Telegram đã đồng bộ.
+            </p>
+          )}
         </div>
       </aside>
+
+      {/* ── Right: Members ────────────────────────────────────────────────── */}
       <section className="flex-1 min-w-0 flex flex-col">
-        {!selectedId ? <div className="m-auto text-center text-gray-400"><p className="text-sm">Chọn một nhóm để xem CRM nhóm</p><p className="text-xs mt-1">Chỉ hiển thị nhóm đã có trong dữ liệu Telegram.</p></div>
-          : channel === 'telegram_bot' ? <div className="m-auto text-center text-gray-400 max-w-sm"><p className="text-sm">Telegram Bot không có danh sách thành viên đầy đủ.</p><p className="text-xs mt-1">Bot API chỉ cho phép campaign tới chat mà bot đã nhận được hoặc nhóm bot đang tham gia.</p></div>
-          : <>
-            <div className="px-4 py-3 border-b border-gray-700 flex items-center gap-3">
-              <div className="min-w-0 flex-1 text-sm text-gray-200 truncate">{groups.find(g => g.contact_id === selectedId)?.display_name || selectedId} <span className="text-xs text-gray-400">· {members.length} thành viên</span></div>
+        {!selectedId ? (
+          <div className="m-auto text-center text-gray-400">
+            <p className="text-sm">Chọn một nhóm để xem CRM nhóm</p>
+            <p className="text-xs mt-1">Chỉ hiển thị nhóm đã có trong dữ liệu Telegram.</p>
+          </div>
+        ) : channel === 'telegram_bot' ? (
+          <div className="m-auto text-center text-gray-400 max-w-sm">
+            <p className="text-sm">Telegram Bot không có danh sách thành viên đầy đủ.</p>
+            <p className="text-xs mt-1">Bot API chỉ cho phép campaign tới chat mà bot đã nhận được hoặc nhóm bot đang tham gia.</p>
+          </div>
+        ) : (
+          <>
+            {/* Members header */}
+            <div className="px-5 py-3.5 border-b border-gray-700 flex items-center gap-3 flex-shrink-0">
+              <Avatar
+                src={selectedGroup?.avatar_url || selectedGroup?.avatar}
+                name={selectedGroup?.display_name || selectedId}
+                size={38}
+              />
+              <div className="min-w-0 flex-1">
+                <h3 className="text-sm font-semibold text-white truncate">
+                  {selectedGroup?.display_name || selectedId}
+                </h3>
+                <p className="text-[11px] text-gray-400 mt-0.5">
+                  {members.length > 0 ? `${members.length} thành viên` : 'Chưa có dữ liệu thành viên'}
+                </p>
+              </div>
               <button onClick={() => loadGroupMembers(selectedId)} disabled={memberLoading} title="Tải lại thành viên"
-                className="px-2.5 py-1.5 rounded-lg border border-gray-600 text-xs text-blue-400 hover:border-blue-500 disabled:opacity-50">
-                {memberLoading ? 'Đang tải…' : '↻ Tải lại'}
+                className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-blue-600 hover:bg-blue-700 disabled:opacity-50 text-white text-xs font-medium transition-colors flex-shrink-0">
+                {memberLoading ? SpinIcon : RefreshIcon}
+                {memberLoading ? 'Đang tải...' : 'Tải lại'}
               </button>
             </div>
-            <div className="px-4 py-2 border-b border-gray-700 flex items-center gap-2">
-              <input value={memberQuery} onChange={event => setMemberQuery(event.target.value)} placeholder="Tìm thành viên..."
-                className="flex-1 bg-gray-800 border border-gray-600 rounded-lg px-2.5 py-1.5 text-xs text-gray-200 outline-none focus:border-blue-500" />
-              <button onClick={() => setSelectedMemberIds(allVisibleSelected ? new Set() : new Set(visibleMembers.map(member => member.id)))} disabled={!visibleMembers.length}
-                className="text-xs text-blue-400 hover:text-blue-300 disabled:opacity-40">{allVisibleSelected ? 'Bỏ chọn' : 'Chọn tất cả'}</button>
+
+            {/* Toolbar */}
+            <div className="px-5 py-2.5 border-b border-gray-700/60 flex items-center gap-2.5 flex-shrink-0">
+              <div className="relative flex-1">
+                <svg className="absolute left-2.5 top-1/2 -translate-y-1/2 text-gray-400" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                  <circle cx="11" cy="11" r="7"/><path d="M21 21l-4.35-4.35"/>
+                </svg>
+                <input value={memberQuery} onChange={event => setMemberQuery(event.target.value)} placeholder="Tìm thành viên..."
+                  className="w-full bg-gray-800 border border-gray-600 rounded-lg pl-8 pr-3 py-2 text-xs text-gray-200 placeholder-gray-500 outline-none focus:border-blue-500 transition-colors" />
+              </div>
+              {visibleMembers.length > 0 && (
+                <button onClick={() => setSelectedMemberIds(allVisibleSelected ? new Set() : new Set(visibleMembers.map(member => member.id)))}
+                  className={`flex items-center gap-1.5 px-2.5 py-2 rounded-lg text-xs font-medium whitespace-nowrap flex-shrink-0 transition-colors border
+                    ${allVisibleSelected
+                      ? 'bg-blue-600/20 border-blue-500/50 text-blue-300 hover:bg-blue-600/30'
+                      : 'bg-blue-600 border-blue-600 text-white hover:bg-blue-700'}`}>
+                  {allVisibleSelected ? (
+                    <>
+                      <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5"><polyline points="20 6 9 17 4 12"/></svg>
+                      Bỏ chọn
+                    </>
+                  ) : (
+                    <>
+                      <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5"><rect x="3" y="3" width="18" height="18" rx="2"/><polyline points="9 11 12 14 22 4"/></svg>
+                      Tất cả ({visibleMembers.length})
+                    </>
+                  )}
+                </button>
+              )}
             </div>
-            <div className="flex-1 overflow-y-auto divide-y divide-gray-700/70 pb-16">{memberLoading && members.length === 0 ? <p className="p-5 text-xs text-gray-400">Đang tải thành viên…</p>
-              : visibleMembers.map(member => {
-                const selected = selectedMemberIds.has(member.id);
-                const name = [member.firstName, member.lastName].filter(Boolean).join(' ') || member.username || member.id;
-                return <button key={member.id} onClick={() => toggleMember(member.id)} className={`w-full px-4 py-2.5 flex gap-2 items-center text-left hover:bg-gray-800/70 ${selected ? 'bg-blue-500/10' : ''}`}>
-                  <span className={`w-4 h-4 rounded border flex items-center justify-center text-[10px] ${selected ? 'bg-blue-600 border-blue-600 text-white' : 'border-gray-600'}`}>{selected ? '✓' : ''}</span>
-                  <Avatar src={member.avatar} name={name} size={28} />
-                  <span className="min-w-0"><span className="block text-xs text-gray-200 truncate">{name}</span><span className="block text-[10px] text-gray-400">{member.username ? '@' + member.username : member.id}</span></span>
-                </button>;
-              })}</div>
-            <div className="border-t border-gray-700 px-4 py-2.5 flex items-center gap-2 bg-gray-850">
-              <span className="text-xs text-gray-400 flex-1">{selectedMemberIds.size ? `Đã chọn ${selectedMemberIds.size} thành viên` : 'Chọn thành viên để thao tác'}</span>
-              <button onClick={openCampaignPicker} disabled={!selectedMemberIds.size} className="px-2.5 py-1.5 rounded-lg bg-blue-600 text-xs text-white hover:bg-blue-700 disabled:bg-gray-700 disabled:text-gray-500">Thêm vào chiến dịch</button>
-              <button onClick={() => setShowAddToContacts(true)} disabled={!selectedMemberIds.size} className="px-2.5 py-1.5 rounded-lg bg-green-600 text-xs text-white hover:bg-green-700 disabled:bg-gray-700 disabled:text-gray-500">Thêm vào liên hệ</button>
+
+            {/* Members list */}
+            <div className="flex-1 overflow-y-auto px-3 py-2">
+              {memberLoading && members.length === 0 ? (
+                <p className="p-5 text-xs text-gray-400">Đang tải thành viên…</p>
+              ) : visibleMembers.length === 0 ? (
+                <p className="p-5 text-center text-xs text-gray-400">Không tìm thấy thành viên.</p>
+              ) : (
+                <div className="space-y-1">
+                  {visibleMembers.map(member => {
+                    const selected = selectedMemberIds.has(member.id);
+                    const name = [member.firstName, member.lastName].filter(Boolean).join(' ') || member.username || member.id;
+                    const rl = roleLabel(member.role);
+                    return (
+                      <button key={member.id} onClick={() => toggleMember(member.id)}
+                        className={`w-full px-3 py-2.5 flex gap-3 items-center text-left rounded-xl border transition-colors select-none
+                          ${selected ? 'bg-blue-500/15 border-blue-500/30' : 'border-transparent hover:bg-gray-800/60'}`}>
+                        <span className={`w-4 h-4 rounded flex items-center justify-center flex-shrink-0 border transition-colors
+                          ${selected ? 'bg-blue-600 border-blue-600 text-white' : 'border-gray-600 bg-gray-800'}`}>
+                          {selected && <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3"><polyline points="20 6 9 17 4 12"/></svg>}
+                        </span>
+                        <Avatar src={member.avatar} name={name} size={32} />
+                        <span className="min-w-0 flex-1">
+                          <span className={`block text-xs truncate font-medium ${selected ? 'text-white' : 'text-gray-200'}`}>{name}</span>
+                          <span className="block text-[10px] text-gray-400 mt-0.5 truncate">
+                            {member.username ? '@' + member.username : member.id}
+                          </span>
+                        </span>
+                        {member.role > 0 && (
+                          <span className={`text-[10px] font-medium px-2 py-0.5 rounded-full flex-shrink-0 border
+                            ${member.role === 2 ? 'border-yellow-500/30 text-yellow-400' : 'border-blue-500/30 text-blue-400'}`}>
+                            {rl.text}
+                          </span>
+                        )}
+                      </button>
+                    );
+                  })}
+                </div>
+              )}
             </div>
-          </>}
+
+            {/* ── Bottom action bar ───────────────────────────────────────── */}
+            <div className="border-t border-gray-600 px-5 py-3 flex items-center gap-3 bg-gray-800/95 backdrop-blur flex-shrink-0">
+              <span className="text-xs text-gray-400 flex-1">
+                {selectedMemberIds.size ? (
+                  <>Đã chọn <span className="text-blue-400 font-medium">{selectedMemberIds.size}</span> thành viên</>
+                ) : 'Chọn thành viên để thao tác'}
+              </span>
+              <button onClick={openCampaignPicker} disabled={!selectedMemberIds.size}
+                className={`flex items-center gap-1.5 px-3.5 py-2 rounded-lg text-xs font-medium transition-colors ${
+                  selectedMemberIds.size
+                    ? 'bg-blue-600 hover:bg-blue-700 text-white'
+                    : 'bg-gray-700 text-gray-500 cursor-not-allowed'
+                }`}>
+                <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5"><path d="M22 12h-4l-3 9L9 3l-3 9H2"/></svg>
+                Thêm vào chiến dịch
+              </button>
+              <button onClick={() => setShowAddToContacts(true)} disabled={!selectedMemberIds.size}
+                className={`flex items-center gap-1.5 px-3.5 py-2 rounded-lg text-xs font-medium transition-colors ${
+                  selectedMemberIds.size
+                    ? 'bg-green-600 hover:bg-green-700 text-white'
+                    : 'bg-gray-700 text-gray-500 cursor-not-allowed'
+                }`}>
+                <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5"><path d="M16 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="8.5" cy="7" r="4"/><path d="M20 8v6M23 11h-6"/></svg>
+                Thêm vào liên hệ
+              </button>
+            </div>
+          </>
+        )}
       </section>
       {showCampaignPicker && !showCreateCampaign && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60" onClick={() => setShowCampaignPicker(false)}>

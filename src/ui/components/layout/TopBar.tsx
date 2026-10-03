@@ -18,6 +18,7 @@ import { useCurrentEmployeeId, useErpPermissions } from '@/hooks/erp/useErpConte
 import NotificationCenter from '@/features/erp/notifications/NotificationCenter';
 import { Spinner } from '@/components/common/PageLoading';
 import { AlertIcon, KeyIcon, MonitorIcon, PluginIcon, RefreshIcon, StarIcon } from '@/components/common/icons';
+import FeatureLauncherPanel from './FeatureLauncherPanel';
 import { isFacebook, isTelegram, isTelegramBot, isTelegramUser } from '@/lib/channelHelper';
 
 
@@ -31,6 +32,7 @@ export default function TopBar() {
   const { theme, setTheme, showNotification, fontSizeScale, setFontSizeScale } = useAppStore();
   const { activeAccountId } = useAccountStore();
   const [loadingOldMsgs, setLoadingOldMsgs] = useState(false);
+  const [featurePanelOpen, setFeaturePanelOpen] = useState(false);
   const [lockScreenEnabled, setLockScreenEnabled] = useState(false);
 
   // More dropdown (guide + bug report + font size)
@@ -329,6 +331,23 @@ export default function TopBar() {
               useChatStore.getState().setContacts(activeAccountId, contacts);
             }
           } catch {}
+          // syncBridgeHistory has completed before getThreads returns. Reload
+          // the open thread so the newly persisted rows appear immediately.
+          const syncedThreadId = useChatStore.getState().activeThreadId;
+          if (syncedThreadId) {
+            try {
+              const messageRes = await DataAccessor.getMessages({
+                zaloId: activeAccountId,
+                threadId: syncedThreadId,
+                limit: 50,
+                offset: 0,
+              });
+              const messages = messageRes?.messages || messageRes?.items || [];
+              if (messages.length > 0) {
+                useChatStore.getState().setMessages(activeAccountId, syncedThreadId, [...messages].reverse());
+              }
+            } catch {}
+          }
           // Refresh avatar cho active thread nếu là 1-1 Facebook
           const chatState = useChatStore.getState();
           const activeThreadId = chatState.activeThreadId;
@@ -568,6 +587,22 @@ export default function TopBar() {
             )}
           </button>
         )}
+
+        {/* Global feature launcher */}
+        <button
+          onClick={() => setFeaturePanelOpen(value => !value)}
+          className={`w-9 h-9 flex items-center justify-center transition-colors ${featurePanelOpen ? 'text-blue-400 bg-gray-700' : 'text-gray-400 hover:bg-gray-700 hover:text-white'}`}
+          title="Tất cả tính năng"
+          aria-label="Tất cả tính năng"
+          aria-expanded={featurePanelOpen}
+        >
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+            <rect x="3" y="3" width="7" height="7" rx="1" />
+            <rect x="14" y="3" width="7" height="7" rx="1" />
+            <rect x="3" y="14" width="7" height="7" rx="1" />
+            <rect x="14" y="14" width="7" height="7" rx="1" />
+          </svg>
+        </button>
 
         {/* Update: now handled by badge next to version + UpdateNotification popup */}
 
@@ -857,6 +892,7 @@ export default function TopBar() {
           </>
         )}
       </div>
+      {featurePanelOpen && <FeatureLauncherPanel onClose={() => setFeaturePanelOpen(false)} />}
     </div>
     </>
   );

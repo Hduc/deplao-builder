@@ -294,8 +294,8 @@ export function registerTelegramUserIpc(): void {
     catch (err: any) { return { success: false, error: err.message }; }
   });
 
-  ipcMain.handle('telegramUser:getMessages', async (_event, params: { accountId: string; chatId: string; limit?: number; offsetId?: number; topicRootMessageId?: string }) => {
-    try { return await TelegramUser.getMessages(params.accountId, params.chatId, { limit: params.limit, offsetId: params.offsetId, topicRootMessageId: params.topicRootMessageId }); }
+  ipcMain.handle('telegramUser:getMessages', async (_event, params: { accountId: string; chatId: string; limit?: number; offsetId?: number; topicRootMessageId?: string; returnMessages?: boolean }) => {
+    try { return await TelegramUser.getMessages(params.accountId, params.chatId, { limit: params.limit, offsetId: params.offsetId, topicRootMessageId: params.topicRootMessageId, returnMessages: params.returnMessages }); }
     catch (err: any) { return { success: false, error: err.message }; }
   });
 

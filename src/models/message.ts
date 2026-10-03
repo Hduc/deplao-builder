@@ -20,6 +20,8 @@ export interface Message {
     reactions?: string;
     is_recalled?: number;
     recalled_content?: string | null;
+    /** Original message type retained after a recall, used to restore media previews. */
+    recalled_msg_type?: string | null;
     deleted_by?: string | null;
     /** ID of the message being replied to (Facebook/others) */
     reply_to_id?: string | null;

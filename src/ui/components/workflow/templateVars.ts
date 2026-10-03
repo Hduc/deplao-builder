@@ -326,8 +326,8 @@ export function getTemplateVarsByGroup(nodeType?: string): Map<TemplateVarGroup,
 }
 
 /**
- * Lấy danh sách node labels từ danh sách node workflow để hiển thị
- * dưới dạng $node.<label>.output và $node.<label>.data.field
+ * Lấy danh sách output node từ workflow. Tham chiếu luôn dùng ID ổn định,
+ * còn label chỉ dùng để hiển thị vì nhiều node có thể cùng tên.
  */
 export function getNodeOutputVars(
   allNodes: { id: string; label: string; type: string }[],
@@ -336,7 +336,7 @@ export function getNodeOutputVars(
   return allNodes
     .filter(n => n.id !== currentId)
     .map(n => ({
-      key: `$node.${n.label}.output`,
+      key: `$node.${n.id}.output`,
       label: `Output từ "${n.label}"`,
       description: `Toàn bộ dữ liệu đầu ra của node "${n.label}" (${n.type}). Dùng .data.field để lấy trường cụ thể.`,
       group: 'node' as TemplateVarGroup,

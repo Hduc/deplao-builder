@@ -6,12 +6,13 @@
  * Reuses the same OpenAI/Gemini/Deepseek/Grok patterns from WorkflowEngineService.
  */
 
-import axios from 'axios';
 import { safeStorage } from 'electron';
 import { v4 as uuidv4 } from 'uuid';
 import DatabaseService from '../database/DatabaseService';
 import IntegrationRegistry from '../integrations/IntegrationRegistry';
 import Logger from '../../utils/Logger';
+import { requestAICompletion } from './AIProviderAdapter';
+import { normalizeAIModel } from '../../shared/aiModelCatalog';
 import type { AIAssistant, AIAssistantFile, ChatMessage, AIPlatform } from '../../models';
 
 // ─── Encryption helpers ───────────────────────────────────────────────────────
@@ -76,22 +77,6 @@ function resolveApiUrl(platform: string, model: string, apiKey: string, baseUrl:
     return 'https://api.anthropic.com/v1/messages';
   }
   return getOpenAICompatibleUrl(platform);
-}
-
-/** Normalize legacy/incorrect model names to current API model IDs */
-function normalizeModelName(model: string): string {
-  const aliases: Record<string, string> = {
-    // DeepSeek - fake versioned names that were never real API model IDs
-    'deepseek-chat-v3.2':    'deepseek-v4-flash',
-    'deepseek-chat-v3.1':    'deepseek-v4-flash',
-    'deepseek-reasoner-r1.5':'deepseek-v4-pro',
-    // Gemini - wrong model IDs (missing -preview suffix or wrong version)
-    'gemini-3.1-pro':        'gemini-3.1-pro-preview',
-    'gemini-3.1-flash':      'gemini-3.5-flash',
-    'gemini-3.0-flash':      'gemini-3-flash-preview',
-    'gemini-3.0-flash-lite': 'gemini-3-flash-preview',
-  };
-  return aliases[model] ?? model;
 }
 
 function openaiMessagesToGemini(messages: ChatMessage[]): any[] {
@@ -159,6 +144,7 @@ class AIAssistantService {
     // If apiKey is the masked placeholder '***', pass it through as-is
     // so the SQL CASE can detect it and preserve the existing key.
     const encrypted = data.apiKey === '***' ? '***' : encryptApiKey(data.apiKey);
+    const model = normalizeAIModel(data.platform, data.model);
 
     const pinnedJson = data.pinnedProductsJson || '[]';
     Logger.info(`[AIAssistant] saveAssistant id=${id}, posIntegrationId=${data.posIntegrationId || 'null'}, pinnedProductsJson.length=${pinnedJson.length}, pinnedPreview=${pinnedJson.substring(0, 200)}`);
@@ -182,7 +168,7 @@ class AIAssistantService {
               enabled = excluded.enabled, is_default = excluded.is_default,
               updated_at = excluded.updated_at`,
       [
-        id, data.name, data.platform, encrypted, data.model,
+        id, data.name, data.platform, encrypted, model,
         data.systemPrompt || '', data.baseUrl || null,
         data.posIntegrationId || null,
         pinnedJson,
@@ -343,7 +329,7 @@ VÍ DỤ ĐẦU RA ĐÚNG:
   ): Promise<{ result: string; totalTokens: number; promptTokens: number; completionTokens: number }> {
     const maxTokens = maxTokensOverride || assistant.maxTokens || 1000;
     const temperature = assistant.temperature ?? 0.7;
-    const model = normalizeModelName(assistant.model);
+    const model = assistant.model;
 
     // Debug: log request info
     const keyPreview = assistant.apiKey ? `${assistant.apiKey.substring(0, 8)}...${assistant.apiKey.substring(assistant.apiKey.length - 4)}` : '(empty)';
@@ -355,85 +341,19 @@ VÍ DỤ ĐẦU RA ĐÚNG:
     let totalTokens = 0;
 
     try {
-      const geminiApiUrl = resolveApiUrl('gemini', model, assistant.apiKey, assistant.baseUrl);
-      const claudeApiUrl = resolveApiUrl('claude', model, assistant.apiKey, assistant.baseUrl);
-      const openaiApiUrl = resolveApiUrl(assistant.platform, model, assistant.apiKey, assistant.baseUrl);
-
-      if (assistant.platform === 'gemini') {
-        const geminiContents = openaiMessagesToGemini(messages);
-        Logger.info(`[AIAssistant] Gemini URL (masked): ${geminiApiUrl.replace(assistant.apiKey, '***')}`);
-        const res = await axios.post(
-          geminiApiUrl,
-          {
-            contents: geminiContents,
-            generationConfig: { maxOutputTokens: maxTokens, temperature },
-          },
-          { headers: { 'Content-Type': 'application/json' }, timeout: 60000 }
-        );
-        result = res.data.candidates?.[0]?.content?.parts?.[0]?.text?.trim() || '';
-        promptTokens = res.data.usageMetadata?.promptTokenCount || 0;
-        completionTokens = res.data.usageMetadata?.candidatesTokenCount || 0;
-        totalTokens = promptTokens + completionTokens;
-      } else if (assistant.platform === 'claude') {
-        Logger.info(`[AIAssistant] Claude URL: ${claudeApiUrl}`);
-        const systemText = messages.filter(m => m.role === 'system').map(m => m.content).join('\n');
-        const claudeMessages = messages
-          .filter(m => m.role !== 'system')
-          .map(m => ({ role: m.role === 'assistant' ? 'assistant' as const : 'user' as const, content: m.content }));
-        const res = await axios.post(
-          claudeApiUrl,
-          {
-            model,
-            max_tokens: maxTokens,
-            ...(systemText ? { system: systemText } : {}),
-            messages: claudeMessages,
-          },
-          {
-            headers: {
-              'x-api-key': assistant.apiKey,
-              'anthropic-version': '2023-06-01',
-              'Content-Type': 'application/json',
-            },
-            timeout: 60000,
-          }
-        );
-        result = res.data.content?.[0]?.text?.trim() || '';
-        promptTokens = res.data.usage?.input_tokens || 0;
-        completionTokens = res.data.usage?.output_tokens || 0;
-        totalTokens = promptTokens + completionTokens;
-      } else {
-        Logger.info(`[AIAssistant] OpenAI-compat URL: ${openaiApiUrl}, model: ${model}`);
-        const tokenParam = assistant.platform === 'openai'
-          ? { max_completion_tokens: maxTokens }
-          : { max_tokens: maxTokens };
-        const res = await axios.post(
-          openaiApiUrl,
-          { model, messages, ...tokenParam, temperature },
-          {
-            headers: {
-              Authorization: `Bearer ${assistant.apiKey}`,
-              'Content-Type': 'application/json',
-            },
-            timeout: 60000,
-          }
-        );
-        // Parse response: support nhiều format khác ngoài OpenAI chuẩn
-        let rawContent = res.data.choices?.[0]?.message?.content;
-        if (!rawContent) rawContent = res.data.choices?.[0]?.text;           // Completions API
-        if (!rawContent) rawContent = res.data?.content;                     // Flat response
-        if (!rawContent) rawContent = res.data?.response;                    // Custom servers
-        if (!rawContent) {
-          // Log response structure để debug (chỉ field names, ko log value)
-          const topKeys = Object.keys(res.data || {}).join(',');
-          const choice0 = res.data?.choices?.[0];
-          const choiceKeys = choice0 ? Object.keys(choice0).join(',') : 'none';
-          Logger.warn(`[AIAssistant] callLLM response empty, topKeys=[${topKeys}], choice0Keys=[${choiceKeys}]`);
-        }
-        result = (rawContent || '').trim();
-        promptTokens = res.data.usage?.prompt_tokens || 0;
-        completionTokens = res.data.usage?.completion_tokens || 0;
-        totalTokens = res.data.usage?.total_tokens || (promptTokens + completionTokens);
-      }
+      const response = await requestAICompletion({
+        platform: assistant.platform,
+        model,
+        apiKey: assistant.apiKey,
+        messages,
+        maxTokens,
+        temperature,
+        baseUrl: assistant.baseUrl,
+      });
+      result = response.result;
+      promptTokens = response.promptTokens;
+      completionTokens = response.completionTokens;
+      totalTokens = response.totalTokens;
     } catch (err: any) {
       // Enhanced error logging
       const status = err.response?.status;
@@ -696,12 +616,24 @@ YÊU CẦU BẮT BUỘC:
   // ─── Row mapper ─────────────────────────────────────────────────────────
 
   private rowToAssistant(row: any): AIAssistant {
+    const model = normalizeAIModel(row.platform || 'openai', row.model);
+    // Persist a known retired ID as soon as the assistant is loaded. This is
+    // intentionally limited to catalog aliases; custom proxy model IDs remain
+    // untouched by normalizeAIModel.
+    if (model && model !== row.model && row.id) {
+      try {
+        DatabaseService.getInstance().run(
+          'UPDATE ai_assistants SET model = ?, updated_at = ? WHERE id = ?',
+          [model, Date.now(), row.id],
+        );
+      } catch {}
+    }
     return {
       id: row.id,
       name: row.name,
       platform: row.platform as AIPlatform,
       apiKey: decryptApiKey(row.api_key_encrypted),
-      model: row.model,
+      model,
       systemPrompt: row.system_prompt || '',
       baseUrl: row.base_url || null,
       posIntegrationId: row.pos_integration_id || null,

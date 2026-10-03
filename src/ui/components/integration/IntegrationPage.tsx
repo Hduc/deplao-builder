@@ -536,6 +536,16 @@ export default function IntegrationPage() {
 
   const workspaceId = useWorkspaceStore(s => s.activeWorkspaceId);
 
+  // Allow the global feature launcher to select a specific integration category.
+  useEffect(() => {
+    const handler = (event: Event) => {
+      const tab = (event as CustomEvent).detail?.tab as TabKey | undefined;
+      if (tab && TABS.some(item => item.key === tab)) setActiveTab(tab);
+    };
+    window.addEventListener('nav:integration', handler);
+    return () => window.removeEventListener('nav:integration', handler);
+  }, []);
+
   const loadList = useCallback(async () => {
     setLoading(true);
     try {

@@ -7,6 +7,7 @@
 import axios from 'axios';
 import { FBSessionData } from './FacebookTypes';
 import { buildFormData, rateLimitDelay } from './FacebookUtils';
+import { assertFacebookMutationSuccess, parseFacebookResponse } from './FacebookGraphQLResult';
 import Logger from '../../utils/Logger';
 
 const GRAPHQL_URL = 'https://www.facebook.com/webgraphql/mutation/';
@@ -53,7 +54,8 @@ export async function createNote(
       },
       timeout: 30000,      ...(httpsAgent ? { httpsAgent } : {}),    });
 
-    const parsed = JSON.parse(response.data.replace(/^for\s*\(;;\);/, '').trim());
+    const parsed = parseFacebookResponse(response.data as string);
+    assertFacebookMutationSuccess('createNote', parsed);
     const noteId = parsed?.data?.note_create?.note?.id;
     return { success: true, noteId: noteId ? String(noteId) : undefined };
   } catch (err: any) {

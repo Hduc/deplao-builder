@@ -203,22 +203,35 @@ export async function fetchBasicProfileFromHome(html: string): Promise<{ name: s
 }
 
 /**
- * Fetch avatar URL cho 1 user Facebook cụ thể bằng cách scrape profile page.
- * Không phụ thuộc vào GraphQL hay cache - luôn trả về URL CDN fresh.
+ * Legacy HTML scraper. It is not identity-safe because Facebook profile pages
+ * may redirect or hydrate a different person. Do not persist a contact name
+ * from this function; use FacebookUserInfo.getFacebookUserInfo instead.
  *
  * Chiến lược:
  *   1. www.facebook.com/profile.php?id={userId} - parse xlink:href hoặc profile_pic_uri
  *   2. Fallback: mbasic.facebook.com/{userId} - HTML nhẹ, parse <img src>
  */
 export async function fetchUserAvatarFromProfile(cookie: string, userId: string, httpsAgent?: any): Promise<string | null> {
-  // Dùng getUserInfoFacebookHtml để tái sử dụng logic fetch + parse
-  const info = await getUserInfoFacebookHtml(cookie, userId, httpsAgent);
-  return info?.avatarUrl || null;
+  // The /picture route is bound to the requested numeric ID, unlike a
+  // hydrated profile document which can describe the currently acting Page.
+  return getFacebookAvatarById(cookie, userId, httpsAgent);
 }
 
 /**
- * Fetch thông tin user Facebook (tên + avatar) từ profile page HTML.
- * Dùng cho E2EE / hội thoại mới không có contact info.
+ * Resolve an avatar through Facebook's ID-bound `/picture` route.
+ *
+ * This works for both people and Pages and only accepts a CDN redirect.  It is
+ * deliberately separate from the legacy profile-HTML parser: an HTML page can
+ * be hydrated for the logged-in/acting account, while this route is addressed
+ * to the requested entity ID.
+ */
+export async function getFacebookAvatarById(cookie: string, userId: string, httpsAgent?: any): Promise<string | null> {
+  if (!/^\d+$/.test(String(userId).trim())) return null;
+  return tryFetchCdnRedirect(cookie, String(userId).trim(), httpsAgent);
+}
+
+/**
+ * Legacy HTML profile fetch. Do not use for contact identity.
  * - Avatar: parse <image style="height:168px;width:168px"> xlink:href
  * - Tên: parse <h1> → <div role="button"> → text content
  */
@@ -321,10 +334,17 @@ async function tryFetchCdnRedirect(cookie: string, userId: string, httpsAgent?: 
     if (err.response?.headers?.location) {
       return err.response.headers.location;
     }
+    // Một số tài khoản/đối tượng E2EE không công khai endpoint /picture.
+    // 404 không phải lỗi phân giải UID; gọi lại cùng endpoint bằng HEAD sẽ chỉ
+    // tạo thêm một request và log lỗi trùng lặp.
+    if (err.response?.status === 404) {
+      Logger.debug(`[FacebookSession] CDN avatar unavailable for ${userId} (404)`);
+      return null;
+    }
     Logger.debug(`[FacebookSession] tryFetchCdnRedirect failed for ${userId}: ${err.message}`);
   }
 
-  // Fallback: GET request với maxRedirects=5 để axios tự follow
+  // Fallback: HEAD request với maxRedirects=5 để axios tự follow
   try {
     const response = await axios.head(`https://www.facebook.com/${userId}/picture?type=large`, {
       headers: {
@@ -408,4 +428,3 @@ async function tryFetchMbasic(cookie: string, userId: string, httpsAgent?: any):
   }
   return null;
 }
-

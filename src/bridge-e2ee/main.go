@@ -20,7 +20,8 @@
 //
 // Methods: hello, newClient, connect, connectE2EE, isConnected, disconnect,
 // sendMessage, sendReaction, sendE2EEMessage, sendE2EEReaction,
-// sendImage, sendFile, sendE2EESticker, sendE2EEAudio, sendE2EEVideo, sendE2EEDocument.
+// sendImage, sendFile, sendE2EESticker, sendE2EEAudio, sendE2EEVideo, sendE2EEDocument,
+// getUserInfo.
 //
 // Build:
 //
@@ -36,6 +37,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 
@@ -201,10 +203,11 @@ func handle(req *request) {
 			"protocolVersion": protocolVersion,
 			"bridgeVersion":   bridgeVersion,
 			"capabilities": []string{
-				"connectE2EE", "sendMessage", "sendE2EEMessage", "sendE2EEImage",
-				"sendE2EEVideo", "sendE2EEAudio", "sendE2EEDocument", "mediaLocalPath",
-				"sendTypingIndicator", "sendE2EETyping", "markRead",
-				"editMessage", "unsendMessage", "editE2EEMessage", "unsendE2EEMessage",
+				"connectE2EE", "sendMessage", "sendReaction", "sendImage", "sendFile",
+				"sendE2EEMessage", "sendE2EEReaction", "sendE2EESticker", "sendE2EEImage",
+				"sendE2EEVideo", "sendE2EEAudio", "sendE2EEDocument", "downloadE2EEAttachment",
+				"mediaLocalPath", "sendTypingIndicator", "sendE2EETyping", "markRead",
+				"editMessage", "unsendMessage", "editE2EEMessage", "unsendE2EEMessage", "syncHistory", "getUserInfo",
 				"nativeLogin",
 			},
 			"maxDecodedMediaBytes": maxDecodedMediaBytes,
@@ -304,14 +307,27 @@ func handle(req *request) {
 			fail(req.ID, fmt.Errorf("client not initialised"))
 			return
 		}
-		user, _, err := client.Connect()
+		user, initialData, err := client.Connect()
 		if err != nil {
 			fail(req.ID, err)
 			return
 		}
 		ok(req.ID, map[string]interface{}{
-			"user": user,
+			"user":        user,
+			"initialData": initialData,
 		})
+
+	case "syncHistory":
+		if client == nil {
+			fail(req.ID, fmt.Errorf("client not initialised"))
+			return
+		}
+		initialData, err := client.SyncHistory()
+		if err != nil {
+			fail(req.ID, err)
+			return
+		}
+		ok(req.ID, initialData)
 
 	case "connectE2EE":
 		if client == nil {
@@ -790,6 +806,32 @@ func handle(req *request) {
 			return
 		}
 		ok(req.ID, res)
+
+	case "getUserInfo":
+		if client == nil {
+			fail(req.ID, fmt.Errorf("client not initialised"))
+			return
+		}
+		// IDs are strings across the Electron boundary to avoid JavaScript number
+		// precision loss. The Messenger task itself requires a signed int64.
+		var p struct {
+			UserID string `json:"userId"`
+		}
+		if err := json.Unmarshal(req.Params, &p); err != nil {
+			fail(req.ID, err)
+			return
+		}
+		userID, err := strconv.ParseInt(p.UserID, 10, 64)
+		if err != nil || userID <= 0 {
+			fail(req.ID, fmt.Errorf("invalid userId"))
+			return
+		}
+		info, err := client.GetUserInfo(&bridge.GetUserInfoOptions{UserID: userID})
+		if err != nil {
+			fail(req.ID, err)
+			return
+		}
+		ok(req.ID, info)
 
 	case "disconnect":
 		if client != nil {

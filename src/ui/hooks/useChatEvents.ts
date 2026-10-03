@@ -152,11 +152,14 @@ export function useChatEvents(): void {
       }
 
       const normalized = normalizeFBMessage(fbAccountId, message);
-      const isSelf = !!message.isSelf || message.userID === fbAccountId;
+      // FacebookService has already compared the MQTT actor with the
+      // account identity. Rechecking `userID` here can wrongly classify an
+      // incoming message as sent when the frontend account id is stale.
+      const isSelf = message.isSelf === true;
       if (isSelf) {
         normalized.is_sent = 1;
         normalized.status = 'sent';
-        normalized.sender_id = fbAccountId;
+        normalized.sender_id = message.userID || fbAccountId;
       }
       const store = useChatStore.getState();
 
@@ -286,21 +289,23 @@ export function useChatEvents(): void {
         channel: 'facebook',
       });
 
-      // ── FE fallback: nếu contact thiếu tên/avatar, tự fetch ────────────────
-      // BE đã fetch trước khi broadcast, nhưng nếu BE fetch fail (timeout/network)
-      // hoặc contact row chưa kịp tạo, FE tự xử lý để tránh hiển thị UID/avatar trống.
-      const rawSenderId = normalized.sender_id || message.userID;
-      if (rawSenderId && /^\d+$/.test(String(rawSenderId)) && !isSelf) {
+      // ── FE fallback: refresh the conversation entity, not the actor ────────
+      // In Page conversations the event actor can be the logged-in/acting
+      // account. Fetching that actor and using it for the thread makes many
+      // Pages display the same account avatar.
+      const threadContact = (useChatStore.getState().contacts[fbAccountId] || [])
+        .find(c => c.contact_id === threadId);
+      if (threadContact?.contact_type !== 'group' && /^\d+$/.test(String(threadId))) {
         const contactsList = useChatStore.getState().contacts[fbAccountId] || [];
-        const senderContact = contactsList.find(c => c.contact_id === rawSenderId);
-        const missingName = !senderContact?.display_name;
-        const missingAvatar = !senderContact?.avatar_url;
+        const conversationContact = contactsList.find(c => c.contact_id === threadId);
+        const missingName = !conversationContact?.display_name;
+        const missingAvatar = !conversationContact?.avatar_url;
         if (missingName || missingAvatar) {
           (async () => {
             try {
-              const result = await ipc.fb?.getUserInfoFacebookHtml({ accountId: fbAccountId, userId: String(rawSenderId) });
+              const result = await ipc.fb?.getUserInfoFacebook({ accountId: fbAccountId, userId: String(threadId) });
               if (result?.success && (result.name || result.avatarUrl)) {
-                const patch: any = { contact_id: rawSenderId, channel: 'facebook' };
+                const patch: any = { contact_id: threadId, channel: 'facebook' };
                 if (result.name) patch.display_name = result.name;
                 if (result.avatarUrl) patch.avatar_url = result.avatarUrl;
                 useChatStore.getState().updateContact(fbAccountId, patch);
@@ -571,4 +576,3 @@ export function useChatEvents(): void {
     };
   }, [activeThreadId]);
 }
-

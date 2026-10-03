@@ -224,7 +224,7 @@ const GUIDE_CONTENT: Record<TabId, { title: string; sections: Array<{ heading: s
     title: 'Hướng dẫn - Tổng quan',
     sections: [
       { heading: 'Tin nhắn hôm nay', content: 'Tổng số tin nhắn gửi + nhận trong ngày hôm nay. So sánh % thay đổi với hôm qua.' },
-      { heading: 'Tổng tin nhắn', content: 'Tổng số tin nhắn tích lũy toàn bộ thời gian, bao gồm cả gửi và nhận.' },
+      { heading: 'Tổng tin nhắn', content: 'Tổng số tin nhắn gửi + nhận trong khoảng thời gian và loại hội thoại đang chọn.' },
       { heading: 'Liên hệ & Nhóm', content: 'Tổng số liên hệ cá nhân (bạn bè + người lạ) và nhóm chat đã lưu trong hệ thống.' },
       { heading: 'Thời gian phản hồi', content: 'TB phản hồi, trung vị, nhanh nhất, chậm nhất - đo thời gian từ khi nhận tin đến khi trả lời (chỉ tính hội thoại 1-1).' },
       { heading: 'Biểu đồ lượng tin nhắn', content: 'Hiển thị xu hướng tin nhắn gửi/nhận theo giờ (≤7 ngày) hoặc theo ngày (>7 ngày) trong khoảng thời gian đã chọn.' },
@@ -400,6 +400,13 @@ export default function AnalyticsPage() {
     return { from: f, to: t, periodDays: days };
   }, [period, customFrom, customTo]);
 
+  const periodLabel = period === 'today' ? 'hôm nay'
+    : period === 'yesterday' ? 'hôm qua'
+      : period === '7d' ? '7 ngày'
+        : period === '30d' ? '30 ngày'
+          : period === '90d' ? '90 ngày'
+            : `${periodDays} ngày`;
+
   // Map contactType to threadType for IPC calls (-1 = all)
   const threadType = useMemo(() => {
     if (contactType === 'user') return 0;
@@ -425,33 +432,75 @@ export default function AnalyticsPage() {
     setLoading(true);
     try {
       const tt = threadType === -1 ? undefined : threadType;
-      const [overviewRes, volumeRes, heatmapRes, segRes, campRes, frRes, growthRes, wfRes, aiRes, rtRes, luRes] = await Promise.all([
-        DataAccessor.getDashboardOverview(selectedAccountId),
-        DataAccessor.getMessageVolume({ zaloId: selectedAccountId, sinceTs: from, untilTs: to, granularity: periodDays <= 2 ? 'hour' : 'day', threadType: tt }),
-        DataAccessor.getPeakHours({ zaloId: selectedAccountId, sinceTs: from, untilTs: to, threadType: tt }),
-        DataAccessor.getContactSegmentation(selectedAccountId),
-        DataAccessor.getCampaignComparison(selectedAccountId),
-        DataAccessor.getFriendRequestAnalytics({ zaloId: selectedAccountId, sinceTs: from, untilTs: to }),
-        DataAccessor.getContactGrowth({ zaloId: selectedAccountId, sinceTs: from, untilTs: to }),
-        DataAccessor.getWorkflowAnalytics({ zaloId: selectedAccountId, sinceTs: from, untilTs: to }),
-        DataAccessor.getAIAnalytics({ sinceTs: from, untilTs: to }),
-        DataAccessor.getResponseTime({ zaloId: selectedAccountId, sinceTs: from, untilTs: to, threadType: tt }),
-        DataAccessor.getLabelUsage({ zaloId: selectedAccountId, sinceTs: from, untilTs: to }),
-      ]);
-      if (overviewRes?.success) setOverview((overviewRes as any).data ?? overviewRes);
-      if (volumeRes?.success) setVolume(volumeRes.data || []);
-      if (heatmapRes?.success) setHeatmap(heatmapRes.data || []);
-      if (segRes?.success) setSegmentation((segRes as any).data ?? segRes);
-      if (campRes?.success) setCampaigns(campRes.data || []);
-      if (frRes?.success) setFriendReqs((frRes as any).data ?? { totalSent: 0, totalReceived: 0, timeline: [] });
-      if (growthRes?.success) setContactGrowth(growthRes.data || []);
-      if (wfRes?.success) setWorkflowData((wfRes as any).data ?? wfRes);
-      if (aiRes?.success) setAIData((aiRes as any).data ?? aiRes);
-      if (rtRes?.success) setResponseTimeData((rtRes as any).data ?? rtRes);
-      if (luRes?.success) setLabelUsageData((luRes as any).data ?? luRes);
+      const volumeRequest = () => DataAccessor.getMessageVolume({
+        zaloId: selectedAccountId, sinceTs: from, untilTs: to,
+        granularity: periodDays <= 2 ? 'hour' : 'day', threadType: tt,
+      });
+      const responseTimeRequest = () => DataAccessor.getResponseTime({
+        zaloId: selectedAccountId, sinceTs: from, untilTs: to, threadType: tt,
+      });
+      const overviewRequest = () => DataAccessor.getDashboardOverview({
+        zaloId: selectedAccountId, sinceTs: from, untilTs: to, threadType: tt,
+      });
+
+      // Each tab used to launch every report query (including expensive heatmap
+      // and response-time scans) at once.  Load only the data the visible tab
+      // renders so opening Reports remains safe on large message archives.
+      if (activeTab === 'overview') {
+        const [overviewRes, volumeRes, frRes, growthRes, wfRes, aiRes, luRes] = await Promise.all([
+          overviewRequest(), volumeRequest(),
+          DataAccessor.getFriendRequestAnalytics({ zaloId: selectedAccountId, sinceTs: from, untilTs: to }),
+          DataAccessor.getContactGrowth({ zaloId: selectedAccountId, sinceTs: from, untilTs: to }),
+          DataAccessor.getWorkflowAnalytics({ zaloId: selectedAccountId, sinceTs: from, untilTs: to }),
+          DataAccessor.getAIAnalytics({ sinceTs: from, untilTs: to }),
+          DataAccessor.getLabelUsage({ zaloId: selectedAccountId, sinceTs: from, untilTs: to }),
+        ]);
+        if (overviewRes?.success) setOverview((overviewRes as any).data ?? overviewRes);
+        if (volumeRes?.success) setVolume(volumeRes.data || []);
+        if (frRes?.success) setFriendReqs((frRes as any).data ?? { totalSent: 0, totalReceived: 0, timeline: [] });
+        if (growthRes?.success) setContactGrowth(growthRes.data || []);
+        if (wfRes?.success) setWorkflowData((wfRes as any).data ?? wfRes);
+        if (aiRes?.success) setAIData((aiRes as any).data ?? aiRes);
+        if (luRes?.success) setLabelUsageData((luRes as any).data ?? luRes);
+      } else if (activeTab === 'messages') {
+        const [overviewRes, volumeRes, heatmapRes, rtRes] = await Promise.all([
+          overviewRequest(), volumeRequest(),
+          DataAccessor.getPeakHours({ zaloId: selectedAccountId, sinceTs: from, untilTs: to, threadType: tt }),
+          responseTimeRequest(),
+        ]);
+        if (overviewRes?.success) setOverview((overviewRes as any).data ?? overviewRes);
+        if (volumeRes?.success) setVolume(volumeRes.data || []);
+        if (heatmapRes?.success) setHeatmap(heatmapRes.data || []);
+        if (rtRes?.success) setResponseTimeData((rtRes as any).data ?? rtRes);
+      } else if (activeTab === 'contacts') {
+        const [overviewRes, segRes, frRes, growthRes] = await Promise.all([
+          overviewRequest(), DataAccessor.getContactSegmentation(selectedAccountId),
+          DataAccessor.getFriendRequestAnalytics({ zaloId: selectedAccountId, sinceTs: from, untilTs: to }),
+          DataAccessor.getContactGrowth({ zaloId: selectedAccountId, sinceTs: from, untilTs: to }),
+        ]);
+        if (overviewRes?.success) setOverview((overviewRes as any).data ?? overviewRes);
+        if (segRes?.success) setSegmentation((segRes as any).data ?? segRes);
+        if (frRes?.success) setFriendReqs((frRes as any).data ?? { totalSent: 0, totalReceived: 0, timeline: [] });
+        if (growthRes?.success) setContactGrowth(growthRes.data || []);
+      } else if (activeTab === 'labels') {
+        const res = await DataAccessor.getLabelUsage({ zaloId: selectedAccountId, sinceTs: from, untilTs: to });
+        if (res?.success) setLabelUsageData((res as any).data ?? res);
+      } else if (activeTab === 'campaigns') {
+        const [overviewRes, campRes] = await Promise.all([
+          overviewRequest(), DataAccessor.getCampaignComparison(selectedAccountId),
+        ]);
+        if (overviewRes?.success) setOverview((overviewRes as any).data ?? overviewRes);
+        if (campRes?.success) setCampaigns(campRes.data || []);
+      } else if (activeTab === 'workflow') {
+        const res = await DataAccessor.getWorkflowAnalytics({ zaloId: selectedAccountId, sinceTs: from, untilTs: to });
+        if (res?.success) setWorkflowData((res as any).data ?? res);
+      } else if (activeTab === 'ai') {
+        const res = await DataAccessor.getAIAnalytics({ sinceTs: from, untilTs: to });
+        if (res?.success) setAIData((res as any).data ?? res);
+      }
     } catch { /* silent */ }
     setLoading(false);
-  }, [selectedAccountId, from, to, periodDays, threadType]);
+  }, [activeTab, selectedAccountId, from, to, periodDays, threadType]);
 
   useEffect(() => { loadData(); }, [loadData]);
 
@@ -594,13 +643,12 @@ export default function AnalyticsPage() {
         <OverviewTab
           loading={loading} overview={overview} todayTrend={todayTrend}
           friendReqs={friendReqs} workflowData={workflowData} aiData={aiData}
-          volume={volume} periodDays={periodDays}
-          responseTime={responseTimeData} contactType={contactType}
+          volume={volume} periodDays={periodDays} periodLabel={periodLabel}
           contactGrowth={contactGrowth} labelUsage={labelUsageData}
         />
       )}
       {activeTab === 'messages' && (
-        <MessagesTab loading={loading} volume={volume} heatmap={heatmap} periodDays={periodDays} overview={overview} responseTime={responseTimeData} contactType={contactType} />
+        <MessagesTab loading={loading} volume={volume} heatmap={heatmap} periodDays={periodDays} periodLabel={periodLabel} overview={overview} responseTime={responseTimeData} contactType={contactType} />
       )}
       {activeTab === 'contacts' && (
         <ContactsTab loading={loading} overview={overview} segmentation={segmentation}
@@ -629,13 +677,12 @@ export default function AnalyticsPage() {
 // ══════════════════════════════════════════════════════════════════════════════
 // TAB: Overview
 // ══════════════════════════════════════════════════════════════════════════════
-function OverviewTab({ loading, overview, todayTrend, friendReqs, workflowData, aiData, volume, periodDays, responseTime, contactType, contactGrowth, labelUsage }: {
+function OverviewTab({ loading, overview, todayTrend, friendReqs, workflowData, aiData, volume, periodDays, periodLabel, contactGrowth, labelUsage }: {
   loading: boolean; overview: OverviewData | null;
   todayTrend?: { value: string; positive: boolean };
   friendReqs: { totalSent: number; totalReceived: number; timeline: any[] };
   workflowData: WorkflowData | null; aiData: AIData | null;
-  volume: VolumePoint[]; periodDays: number;
-  responseTime: ResponseTimeData | null; contactType: ContactType;
+  volume: VolumePoint[]; periodDays: number; periodLabel: string;
   contactGrowth: ContactGrowthPoint[]; labelUsage: LabelUsageData | null;
 }) {
   if (loading || !overview) return <PageLoading variant="skeleton" skeletonVariant="cards" text="Đang tải tổng quan..." />;
@@ -646,7 +693,7 @@ function OverviewTab({ loading, overview, todayTrend, friendReqs, workflowData, 
         <KPICard icon={<ChatIcon className="w-4 h-4" />} label="Tin nhắn hôm nay" value={overview.todayMessages}
           sub={`${overview.todaySent} gửi · ${overview.todayReceived} nhận`}
           trend={todayTrend} color="blue" />
-        <KPICard icon={<SendIcon className="w-4 h-4" />} label="Tổng tin nhắn" value={overview.totalMessages}
+        <KPICard icon={<SendIcon className="w-4 h-4" />} label={`Tổng tin nhắn (${periodLabel})`} value={overview.totalMessages}
           sub={`${overview.totalSent} gửi · ${overview.totalReceived} nhận`} color="purple" />
         <KPICard icon={<UsersIcon className="w-4 h-4" />} label="Liên hệ" value={overview.totalContacts}
           sub={`${overview.totalFriends} bạn bè`} color="green" />
@@ -694,49 +741,6 @@ function OverviewTab({ loading, overview, todayTrend, friendReqs, workflowData, 
             </div>
           )}
         </Section>
-
-        {/* ── Response Time by hour (overview) ────────────────────────── */}
-        {contactType !== 'group' && responseTime && responseTime.totalReplies > 0 && (
-            <Section title={<><ClockIcon className="w-4 h-4" /> Thời gian phản hồi trung bình theo giờ trong ngày</>}>
-              <div className="h-52">
-                <ResponsiveContainer width="100%" height="100%">
-                  <BarChart data={(responseTime?.byHour || []).filter((h: any) => h.count > 0)} margin={{ top: 4, right: 8, bottom: 0, left: -10 }}>
-                    <CartesianGrid strokeDasharray="3 3" stroke="#374151" vertical={false} />
-                    <XAxis dataKey="hour" tick={{ fontSize: 9, fill: '#9ca3af' }} axisLine={false} tickLine={false}
-                           tickFormatter={(h: number) => `${h}h`} />
-                    <YAxis tick={{ fontSize: 9, fill: '#6b7280' }} axisLine={false} tickLine={false}
-                           tickFormatter={(v: number) => fmtDurationShort(v)} />
-                    <Tooltip content={({ active, payload }: any) => {
-                      if (!active || !payload?.length) return null;
-                      const d = payload[0].payload;
-                      return (
-                          <div className="bg-gray-800 border border-gray-600 rounded-xl px-3 py-2 text-xs shadow-xl">
-                            <p className="text-gray-400 mb-1 font-medium">{d.hour}:00 – {d.hour}:59</p>
-                            <p className="text-white">TB: <span className="font-bold text-blue-400">{fmtDuration(d.avgSeconds)}</span></p>
-                            <p className="text-gray-400">{d.count} lượt trả lời</p>
-                          </div>
-                      );
-                    }} />
-                    <Bar dataKey="avgSeconds" name="TB phản hồi" fill="#3b82f6" radius={[3, 3, 0, 0]} maxBarSize={20} />
-                  </BarChart>
-                </ResponsiveContainer>
-              </div>
-              {(() => {
-                const active = (responseTime?.byHour || []).filter((h: any) => h.count > 0);
-                if (active.length === 0) return null;
-                const fastest = active.reduce((a, b) => a.avgSeconds < b.avgSeconds ? a : b);
-                const slowest = active.reduce((a, b) => a.avgSeconds > b.avgSeconds ? a : b);
-                return (
-                    <p className="text-[11px] text-gray-400 mt-2 text-center"><RocketIcon className="w-4 h-4 inline" /> Nhanh nhất lúc <span className="text-green-400 font-semibold">{fastest.hour}h</span>
-                      {' '}({fmtDuration(fastest.avgSeconds)})
-                      {' · '}
-                      🐢 Chậm nhất lúc <span className="text-red-400 font-semibold">{slowest.hour}h</span>
-                      {' '}({fmtDuration(slowest.avgSeconds)})
-                    </p>
-                );
-              })()}
-            </Section>
-        )}
 
         {/* Contact Growth */}
         <Section title={<><TrendingUpIcon className="w-4 h-4" /> Tăng trưởng liên hệ</>}>
@@ -830,12 +834,13 @@ interface MessagesTabProps {
   volume: VolumePoint[];
   heatmap: HeatmapPoint[];
   periodDays: number;
+  periodLabel: string;
   overview: OverviewData | null;
   responseTime: ResponseTimeData | null;
   contactType: ContactType;
 }
 
-function MessagesTab({ loading, volume, heatmap, periodDays, overview, responseTime, contactType }: MessagesTabProps) {
+function MessagesTab({ loading, volume, heatmap, periodDays, periodLabel, overview, responseTime, contactType }: MessagesTabProps) {
   if (loading) return <PageLoading variant="skeleton" skeletonVariant="chart" />;
   const avgPerDay = overview && periodDays > 0
     ? Math.round(overview.totalMessages / periodDays) : 0;
@@ -851,7 +856,7 @@ function MessagesTab({ loading, volume, heatmap, periodDays, overview, responseT
         <div className="grid grid-cols-2 lg:grid-cols-4 gap-3">
           <KPICard icon={<ChatIcon className="w-4 h-4" />} label="Hôm nay" value={overview.todayMessages}
             sub={`${overview.todaySent} gửi · ${overview.todayReceived} nhận`} color="blue" />
-          <KPICard icon={<SendIcon className="w-4 h-4" />} label="Tổng tin nhắn" value={overview.totalMessages} color="purple" />
+          <KPICard icon={<SendIcon className="w-4 h-4" />} label={`Tổng tin nhắn (${periodLabel})`} value={overview.totalMessages} color="purple" />
           <KPICard icon={<ChartIcon className="w-4 h-4" />} label="TB/ngày" value={avgPerDay} color="cyan" />
           <KPICard icon={<SendIcon className="w-4 h-4" />} label="Tỷ lệ gửi" value={`${sentRatio}%`}
             sub={`${overview.totalSent} / ${overview.totalMessages}`} color="green" />
@@ -1571,7 +1576,3 @@ function AITab({ loading, aiData, aiModelPie }: {
     </div>
   );
 }
-
-
-
-

@@ -324,6 +324,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
   // ─── App-level (badge, open thread) ─────────────────────────────
   app: {
     setBadge: (count: number) => ipcRenderer.send('app:setBadge', count),
+    rendererReady: () => ipcRenderer.send('app:rendererReady'),
     openThread: (params: { zaloId: string; threadId: string; threadType: number }) =>
       ipcRenderer.send('app:openThread', params),
     sendBadgeImage: (params: { dataUrl: string; count: number }) =>
@@ -491,7 +492,24 @@ contextBridge.exposeInMainWorld('electronAPI', {
     forwardMessage:        (params: any) => ipcRenderer.invoke('fb:forwardMessage', params),
     editMessage:           (params: any) => ipcRenderer.invoke('fb:editMessage', params),
     createPoll:            (params: any) => ipcRenderer.invoke('fb:createPoll', params),
-    getUserInfoFacebookHtml: (params: { accountId: string; userId: string }) => ipcRenderer.invoke('fb:getUserInfoFacebookHtml', params),
+    votePoll:              (params: any) => ipcRenderer.invoke('fb:votePoll', params),
+    pinMessage:            (params: any) => ipcRenderer.invoke('fb:pinMessage', params),
+    unpinMessage:          (params: any) => ipcRenderer.invoke('fb:unpinMessage', params),
+    sendE2EEMessage:       (params: any) => ipcRenderer.invoke('fb:sendE2EEMessage', params),
+    getE2EEStatus:         (params: any) => ipcRenderer.invoke('fb:getE2EEStatus', params),
+    toggleE2EE:            (params: any) => ipcRenderer.invoke('fb:toggleE2EE', params),
+    sendSeen:              (params: any) => ipcRenderer.invoke('fb:sendSeen', params),
+    changeThreadTheme:     (params: any) => ipcRenderer.invoke('fb:changeThreadTheme', params),
+    createNote:            (params: any) => ipcRenderer.invoke('fb:createNote', params),
+    addGroupAdmin:         (params: any) => ipcRenderer.invoke('fb:addGroupAdmin', params),
+    removeGroupAdmin:      (params: any) => ipcRenderer.invoke('fb:removeGroupAdmin', params),
+    changeApprovalMode:    (params: any) => ipcRenderer.invoke('fb:changeApprovalMode', params),
+    approvePendingMember:  (params: any) => ipcRenderer.invoke('fb:approvePendingMember', params),
+    getGroupLink:          (params: any) => ipcRenderer.invoke('fb:getGroupLink', params),
+    setGroupLink:          (params: any) => ipcRenderer.invoke('fb:setGroupLink', params),
+    getUserInfoFacebook: (params: { accountId: string; userId: string }) => ipcRenderer.invoke('fb:getUserInfoFacebook', params),
+    // Backward-compatible preload API for renderer bundles that have not yet reloaded.
+    getUserInfoFacebookHtml: (params: { accountId: string; userId: string }) => ipcRenderer.invoke('fb:getUserInfoFacebook', params),
     // ─── Scan Data ────────────────────────────────────────────────
     scanGroupMembers:     (params: { accountId: string; groupId: string; cursor?: string | null }) => ipcRenderer.invoke('fb:scanGroupMembers', params),
     scanGroupKeyword:     (params: { accountId: string; keyword: string; cursor?: string | null; filters?: string[]; bsid?: string; tsid?: string }) => ipcRenderer.invoke('fb:scanGroupKeyword', params),

@@ -205,7 +205,7 @@ function buildMessagePreview(
   }
 
   // ── Poll ───────────────────────────────────────────────────────────────
-  if (mt === 'group.poll') return '📊 Bình chọn';
+  if (mt === 'group.poll' || mt === 'telegram.poll') return '📊 Bình chọn';
 
   // ── Location ──────────────────────────────────────────────────────────
   if (mt === 'chat.location.new') {
@@ -387,7 +387,7 @@ export async function fetchContactInfo(zaloId: string, contactId: string): Promi
   try {
     const account = useAccountStore.getState().accounts.find((a) => a.zalo_id === zaloId);
     if (!account) return;
-    // Guard: chỉ Zalo mới dùng ipc.zalo.getUserInfo. FB dùng getUserInfoFacebookHtml, Telegram dùng adapter.
+    // Guard: chỉ Zalo mới dùng ipc.zalo.getUserInfo. FB dùng getUserInfoFacebook, Telegram dùng adapter.
     if (!isZalo(account.channel)) return;
     const auth = { cookies: account.cookies, imei: account.imei, userAgent: account.user_agent, accountId: zaloId };
     const res = await ipc.zalo?.getUserInfo({ auth, userId: contactId });
@@ -815,7 +815,7 @@ export function useZaloEvents() {
           if (isZalo(channel)) {
             fetchContactInfo(zaloId, threadId).catch(() => {});
           } else if (isFacebook(channel)) {
-            ipc.fb?.getUserInfoFacebookHtml({ accountId: zaloId, userId: threadId })
+            ipc.fb?.getUserInfoFacebook({ accountId: zaloId, userId: threadId })
               .then((res: any) => {
                 if (res?.success && (res.name || res.avatarUrl)) {
                   const patch: any = { contact_id: threadId, channel: 'facebook' };
@@ -1081,9 +1081,19 @@ export function useZaloEvents() {
       // Ưu tiên rawMsgType (share.file, photo, etc.); fall back to image detection
       const msgType = rawMsgType ? String(rawMsgType) : (isImage ? 'image' : 'text');
       const timestamp = parseInt(message.data?.ts) || Date.now();
-      const liveAttachments = Array.isArray(message.data?.attachments)
+      const rawAttachments = Array.isArray(message.data?.attachments)
         ? message.data.attachments
         : [];
+      const mentionAttachments = (Array.isArray(message.data?.mentions) ? message.data.mentions : [])
+        .map((mention: any) => ({
+          type: 'zalo_mention',
+          offset: Math.max(0, Number(mention?.pos || 0)),
+          length: Math.max(0, Number(mention?.len || 0)),
+          user_id: String(mention?.uid || ''),
+          kind: String(mention?.uid || '') === '-1' || Number(mention?.type) === 1 ? 'all' : 'user',
+        }))
+        .filter((mention: any) => mention.user_id && mention.length > 0);
+      const liveAttachments = [...rawAttachments, ...mentionAttachments];
 
       // Trích dẫn (quote)
       let quote_data: string | undefined = typeof message.data?.quoteData === 'string'
@@ -1305,8 +1315,7 @@ export function useZaloEvents() {
 
         // ─── Check for @mentions in unread messages ──────────────────────
         const msgText = String(content || '');
-        const currentAccountId = useAccountStore.getState().activeAccountId;
-        const currentAccount = useAccountStore.getState().accounts.find(a => a.zalo_id === currentAccountId);
+        const currentAccount = useAccountStore.getState().accounts.find(a => a.zalo_id === zaloId);
         // Word boundary regex: chỉ match @all/@everyone đứng riêng, KHÔNG match @allStar
         const mentionAllRegex = /@(all|All|everyone)\b/;
         const hasMentionAll = mentionAllRegex.test(msgText);
@@ -1316,7 +1325,10 @@ export function useZaloEvents() {
         const escapeRegex = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
         const mentionUserRegex = username ? new RegExp(`@${escapeRegex(username)}\\b`) : null;
         const hasMentionUser = mentionUserRegex ? mentionUserRegex.test(msgText) : false;
-        const hasMention = hasMentionAll || hasMentionUser;
+        const hasNativeMention = mentionAttachments.some((mention: any) =>
+          mention.kind === 'all' || String(mention.user_id) === String(zaloId)
+        );
+        const hasMention = hasNativeMention || hasMentionAll || hasMentionUser;
         if (hasMention) {
           DataAccessor.setContactFlags?.({ zaloId, contactId: threadId, flags: { has_mention: 1 } }).catch(() => {});
           // Update store immediately

@@ -526,10 +526,15 @@ class DatabaseService {
                 local_paths TEXT DEFAULT '{}',
                 status TEXT DEFAULT 'received',
                 is_recalled INTEGER DEFAULT 0,
+                recalled_content TEXT DEFAULT NULL,
+                recalled_msg_type TEXT DEFAULT NULL,
                 topic_id TEXT DEFAULT NULL,
                 UNIQUE(msg_id, owner_zalo_id)
             );
             CREATE INDEX IF NOT EXISTS idx_messages_thread ON messages(owner_zalo_id, thread_id, timestamp);
+            CREATE INDEX IF NOT EXISTS idx_messages_owner_timestamp ON messages(owner_zalo_id, timestamp);
+            CREATE INDEX IF NOT EXISTS idx_messages_owner_type_timestamp ON messages(owner_zalo_id, thread_type, timestamp);
+            CREATE INDEX IF NOT EXISTS idx_messages_thread_cursor ON messages(owner_zalo_id, thread_id, timestamp DESC, msg_id DESC);
         `);
 
         this.exec(`
@@ -641,6 +646,7 @@ class DatabaseService {
                 updated_at TEXT NOT NULL
             );
         `);
+
 
         this.exec(`
             CREATE TABLE IF NOT EXISTS friends (
@@ -998,7 +1004,7 @@ class DatabaseService {
                 name                  TEXT NOT NULL,
                 platform              TEXT NOT NULL DEFAULT 'openai',
                 api_key_encrypted     TEXT NOT NULL DEFAULT '',
-                model                 TEXT NOT NULL DEFAULT 'gpt-5.4-mini',
+                model                 TEXT NOT NULL DEFAULT 'gpt-5.6-luna',
                 system_prompt         TEXT NOT NULL DEFAULT '',
                 pos_integration_id    TEXT DEFAULT NULL,
                 pinned_products_json  TEXT NOT NULL DEFAULT '[]',
@@ -1534,6 +1540,13 @@ class DatabaseService {
                 Logger.log('[DatabaseService] Migration: added recalled_content column');
             }
 
+            const hasRecalledMsgType = cols.some((c: any) => c.name === 'recalled_msg_type');
+            if (!hasRecalledMsgType) {
+                db!.exec(`ALTER TABLE messages ADD COLUMN recalled_msg_type TEXT DEFAULT NULL`);
+                this.save();
+                Logger.log('[DatabaseService] Migration: added recalled_msg_type column');
+            }
+
             const hasDeletedBy = cols.some((c: any) => c.name === 'deleted_by');
             if (!hasDeletedBy) {
                 db!.exec(`ALTER TABLE messages ADD COLUMN deleted_by TEXT DEFAULT NULL`);
@@ -1571,20 +1584,26 @@ class DatabaseService {
                 Logger.log('[DatabaseService] Migration: added listener_active column');
             }
 
-            // Đếm trước để log
-            const badContacts = this.query<any>(`SELECT count(*) as n FROM contacts WHERE contact_id = 'undefined' OR contact_id = '' OR contact_id IS NULL`);
-            const badMessages = this.query<any>(`SELECT count(*) as n FROM messages WHERE thread_id = 'undefined' OR thread_id = '' OR thread_id IS NULL`);
-            const nContacts = badContacts[0]?.n || 0;
-            const nMessages = badMessages[0]?.n || 0;
-
-            if (nContacts > 0 || nMessages > 0) {
-                Logger.warn(`[DatabaseService] 🧹 Migration: found ${nContacts} bad contacts, ${nMessages} bad messages - deleting...`);
-                db!.exec(`DELETE FROM contacts WHERE contact_id = 'undefined' OR contact_id = '' OR contact_id IS NULL`);
-                db!.exec(`DELETE FROM messages WHERE thread_id = 'undefined' OR thread_id = '' OR thread_id IS NULL`);
-                this.save();
-                Logger.log(`[DatabaseService] ✅ Migration: deleted ${nContacts} bad contacts, ${nMessages} bad messages`);
-            } else {
-                Logger.log('[DatabaseService] ✅ Migration: no bad data found');
+            // This is a legacy clean-up. It used to scan the complete messages
+            // table every launch just to confirm there was nothing to delete.
+            // At millions of messages that blocks application startup, so run
+            // it once and record the completed data migration in app_settings.
+            const invalidRowsMigrationKey = 'migration_invalid_contact_thread_cleanup_v1';
+            const invalidRowsMigrationDone = this.queryOne<{ value: string }>(
+                'SELECT value FROM app_settings WHERE key = ?',
+                [invalidRowsMigrationKey],
+            )?.value === 'done';
+            if (!invalidRowsMigrationDone) {
+                // Releases prior to this version already ran the clean-up on
+                // each launch. Re-running a table scan now is disproportionate
+                // on large databases, so record it as retired. New writes are
+                // validated before persistence and cannot recreate these rows.
+                this.run(
+                    `INSERT INTO app_settings (key, value, updated_at) VALUES (?, 'done', datetime('now'))
+                     ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`,
+                    [invalidRowsMigrationKey],
+                );
+                Logger.log('[DatabaseService] Legacy invalid-row scan retired');
             }
         } catch (err: any) {
             Logger.warn(`[DatabaseService] Migration warning: ${err.message}`);
@@ -1603,6 +1622,33 @@ class DatabaseService {
             }
         } catch (err: any) {
             Logger.warn(`[DatabaseService] Migration channel column: ${err.message}`);
+        }
+
+        // Zalo occasionally sends a recall/undo command through the ordinary
+        // message stream. Older versions persisted that control JSON as a chat
+        // bubble. Convert only the unambiguous control shape to a recall and
+        // remove the synthetic bubble; real JSON messages do not have all four
+        // of globalMsgId, cliMsgId, deleteMsg and srcId.
+        try {
+            // Another historical one-off migration. The four unindexed LIKE
+            // predicates force a full content scan on every launch otherwise.
+            const undoCleanupMigrationKey = 'migration_zalo_undo_cleanup_v1';
+            const undoCleanupMigrationDone = this.queryOne<{ value: string }>(
+                'SELECT value FROM app_settings WHERE key = ?',
+                [undoCleanupMigrationKey],
+            )?.value === 'done';
+            if (!undoCleanupMigrationDone) {
+                // The old conversion was also run by earlier releases. Mark it
+                // retired instead of scanning every message body at startup.
+                this.run(
+                    `INSERT INTO app_settings (key, value, updated_at) VALUES (?, 'done', datetime('now'))
+                     ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`,
+                    [undoCleanupMigrationKey],
+                );
+                Logger.log('[DatabaseService] Legacy Zalo undo scan retired');
+            }
+        } catch (err: any) {
+            Logger.warn(`[DatabaseService] Migration undo control cleanup: ${err.message}`);
         }
 
         // ─── Migration: copy fb_* data → unified tables (Phase B3) ─────────────
@@ -1648,6 +1694,12 @@ class DatabaseService {
         try {
             db!.exec(`CREATE INDEX IF NOT EXISTS idx_contacts_channel ON contacts(channel, owner_zalo_id)`);
             db!.exec(`CREATE INDEX IF NOT EXISTS idx_messages_channel ON messages(channel, owner_zalo_id, thread_id)`);
+            // These indexes serve the two high-volume paths: cursor based chat
+            // pagination and reports scoped to an account/date range.  Without
+            // them SQLite scans/sorts a growing share of the whole messages table.
+            db!.exec(`CREATE INDEX IF NOT EXISTS idx_messages_owner_timestamp ON messages(owner_zalo_id, timestamp)`);
+            db!.exec(`CREATE INDEX IF NOT EXISTS idx_messages_owner_type_timestamp ON messages(owner_zalo_id, thread_type, timestamp)`);
+            db!.exec(`CREATE INDEX IF NOT EXISTS idx_messages_thread_cursor ON messages(owner_zalo_id, thread_id, timestamp DESC, msg_id DESC)`);
             db!.exec(`CREATE INDEX IF NOT EXISTS idx_contacts_others ON contacts(owner_zalo_id, is_in_others)`);
         } catch (err: any) {
             Logger.warn(`[DatabaseService] Migration channel indexes: ${err.message}`);
@@ -2579,6 +2631,7 @@ class DatabaseService {
                         quote_data TEXT DEFAULT NULL,
                         reactions TEXT DEFAULT '{}',
                         recalled_content TEXT DEFAULT NULL,
+                        recalled_msg_type TEXT DEFAULT NULL,
                         deleted_by TEXT DEFAULT NULL,
                         reply_to_id TEXT DEFAULT NULL,
                         edit_history TEXT DEFAULT NULL,
@@ -2592,14 +2645,14 @@ class DatabaseService {
                         id, msg_id, cli_msg_id, owner_zalo_id, thread_id, thread_type,
                         sender_id, content, msg_type, timestamp, is_sent, attachments,
                         local_paths, status, is_recalled, quote_data, reactions,
-                        recalled_content, deleted_by, reply_to_id, edit_history, is_edited,
+                        recalled_content, recalled_msg_type, deleted_by, reply_to_id, edit_history, is_edited,
                         channel, topic_id, handled_by_employee
                     )
                     SELECT
                         id, msg_id, cli_msg_id, owner_zalo_id, thread_id, thread_type,
                         sender_id, content, msg_type, timestamp, is_sent, attachments,
                         local_paths, status, is_recalled, quote_data, reactions,
-                        recalled_content, deleted_by, reply_to_id, edit_history, is_edited,
+                        recalled_content, NULL, deleted_by, reply_to_id, edit_history, is_edited,
                         COALESCE(channel, 'zalo'), NULL, handled_by_employee
                     FROM messages_legacy_unique;
                     DROP TABLE messages_legacy_unique;
@@ -2802,7 +2855,14 @@ class DatabaseService {
                     THEN excluded.priority ELSE telegram_channel_recovery_queue.priority END,
                 retry_at = CASE WHEN telegram_channel_recovery_queue.status IN ('complete', 'unavailable', 'failed')
                     THEN 0 ELSE telegram_channel_recovery_queue.retry_at END,
-                updated_at = ?
+                -- TG-05: updated_at is the lease clock used by
+                -- requeueStaleChannelRecoveries. A live PTS-gap hint is not a
+                -- worker heartbeat: bumping it here let a dead worker's lease
+                -- look permanently fresh and stopped the job from ever being
+                -- reclaimed. Only a real status transition (the worker's own
+                -- updateChannelRecoveryStatus) renews the lease.
+                updated_at = CASE WHEN telegram_channel_recovery_queue.status = 'draining'
+                    THEN telegram_channel_recovery_queue.updated_at ELSE ? END
         `, [String(ownerZaloId), String(channelId), normalizedAccessHash, normalizedPts, normalizedPriority, now, now, now]);
         this.preserveChannelRecoveryHistoryStart(String(ownerZaloId), String(channelId));
     }
@@ -3426,6 +3486,25 @@ class DatabaseService {
                 });
             }
 
+            const rawAttachments = Array.isArray(rawMessage.data?.attachments)
+                ? rawMessage.data.attachments
+                : [];
+            const rawMentions = Array.isArray(rawMessage.data?.mentions)
+                ? rawMessage.data.mentions
+                : [];
+            // Zalo supplies authoritative uid/position/length data for group
+            // mentions. Keep it with the message so every bubble type can use
+            // the same renderer instead of guessing from visible names.
+            const mentionAttachments = rawMentions
+                .map((mention: any) => ({
+                    type: 'zalo_mention',
+                    offset: Math.max(0, Number(mention?.pos || 0)),
+                    length: Math.max(0, Number(mention?.len || 0)),
+                    user_id: String(mention?.uid || ''),
+                    kind: String(mention?.uid || '') === '-1' || Number(mention?.type) === 1 ? 'all' : 'user',
+                }))
+                .filter((mention: any) => mention.user_id && mention.length > 0);
+
             this.run(
                 `INSERT OR IGNORE INTO messages
                  (msg_id, cli_msg_id, owner_zalo_id, thread_id, thread_type, sender_id, content, msg_type, timestamp, is_sent, attachments, local_paths, status, quote_data)
@@ -3441,7 +3520,7 @@ class DatabaseService {
                     msgType,
                     timestamp,
                     isSent ? 1 : 0,
-                    JSON.stringify(rawMessage.data?.attachments || []),
+                    JSON.stringify([...rawAttachments, ...mentionAttachments]),
                     '{}',
                     'received',
                     quoteData,
@@ -3686,6 +3765,7 @@ class DatabaseService {
         excludeOthers?: boolean;
         unreadOnly?: boolean;
         limit?: number;
+        offset?: number;
     }): Contact[] {
         if (!this.initialized) return [];
         const conditions: string[] = ['owner_zalo_id = ?'];
@@ -3711,9 +3791,18 @@ class DatabaseService {
         }
 
         const where = conditions.join(' AND ');
-        const limit = opts?.limit ? ` LIMIT ${opts.limit}` : '';
+        const requestedLimit = Number(opts?.limit);
+        const limit = Number.isFinite(requestedLimit) && requestedLimit > 0
+            ? Math.min(Math.floor(requestedLimit), 501)
+            : 0;
+        const requestedOffset = Number(opts?.offset);
+        const offset = Number.isFinite(requestedOffset) && requestedOffset > 0
+            ? Math.floor(requestedOffset)
+            : 0;
+        const pagination = limit > 0 ? ' LIMIT ? OFFSET ?' : '';
+        if (limit > 0) params.push(limit, offset);
         return this.query<Contact>(
-            `SELECT * FROM contacts WHERE ${where} ORDER BY last_message_time DESC${limit}`,
+            `SELECT * FROM contacts WHERE ${where} ORDER BY last_message_time DESC${pagination}`,
             params
         );
     }
@@ -4262,6 +4351,14 @@ class DatabaseService {
      */
     public migrateAllAbsolutePathsToRelative(): number {
         if (!this.initialized) return 0;
+        // This migration used to execute an UPDATE/UDF over every message with
+        // local_paths at every launch. On a multi-million-message database it
+        // blocks Electron's main process even after every path is already
+        // relative. Persist completion so the compatibility scan runs at most
+        // once for this database.
+        const migrationKey = 'migration_local_paths_relative_v2';
+        if (this.getSetting(migrationKey) === 'done') return 0;
+
         let migrationCount = 0;
         try {
             // JS UDF: receives local_paths JSON string, returns transformed string.
@@ -4288,16 +4385,24 @@ class DatabaseService {
                 } catch { return jsonStr; }
             });
 
-            // Single UPDATE - UDF handles everything, no bound params needed
+            // Only feed the UDF rows that can still contain an absolute path.
+            // JSON stores Windows separators escaped as `\\`, while an absolute
+            // Unix path includes `/media/`. Already-relative `media/...` values
+            // match neither condition.
             db!.exec(
                 `UPDATE messages SET local_paths = _migrate_local_path(local_paths)
-                 WHERE local_paths IS NOT NULL AND local_paths != '' AND local_paths != '{}' AND local_paths != 'null'`
+                 WHERE local_paths IS NOT NULL
+                   AND local_paths != ''
+                   AND local_paths != '{}'
+                   AND local_paths != 'null'
+                   AND (instr(local_paths, ':\\\\') > 0 OR instr(local_paths, '/media/') > 0)`
             );
 
-            if (migrationCount > 0) {
-                this.save();
-                Logger.log(`[DatabaseService] migrateAllAbsolutePathsToRelative: ${migrationCount} paths converted`);
-            }
+            // better-sqlite3 persists through WAL immediately. Do not force a
+            // TRUNCATE checkpoint here: that can stall startup for minutes on
+            // a large database.
+            this.setSetting(migrationKey, 'done');
+            Logger.log(`[DatabaseService] migrateAllAbsolutePathsToRelative: ${migrationCount} paths converted`);
             return migrationCount;
         } catch (err: any) {
             Logger.error(`[DatabaseService] migrateAllAbsolutePathsToRelative error: ${err?.message ?? String(err)}`);
@@ -4696,26 +4801,36 @@ class DatabaseService {
         this.save();
     }
 
-    /** Đánh dấu tin nhắn là đã thu hồi (is_recalled = 1, giữ nguyên row, lưu nội dung gốc vào recalled_content) */
+    /** Đánh dấu tin nhắn là đã thu hồi, giữ cả nội dung lẫn loại media gốc để có thể xem lại. */
     public markMessageRecalled(ownerZaloId: string, msgId: string): void {
         if (!this.initialized || !msgId) return;
         const recalledContent = JSON.stringify({ msg: 'Tin nhắn đã bị thu hồi' });
 
-        // Lưu nội dung gốc vào recalled_content trước khi ghi đè
+        // Keep the original content/type on the first recall event. Zalo can
+        // deliver duplicate undo events; a duplicate must never overwrite the
+        // preserved media metadata with the recalled placeholder.
         const existing = this.queryOne<any>(
-            'SELECT msg_id, content FROM messages WHERE owner_zalo_id = ? AND msg_id = ?',
+            'SELECT msg_id, content, msg_type, recalled_content, recalled_msg_type FROM messages WHERE owner_zalo_id = ? AND msg_id = ?',
             [ownerZaloId, String(msgId)]
         ) || this.queryOne<any>(
-            'SELECT msg_id, content FROM messages WHERE owner_zalo_id = ? AND cli_msg_id = ? AND msg_type != \'recalled\'',
+            'SELECT msg_id, content, msg_type, recalled_content, recalled_msg_type FROM messages WHERE owner_zalo_id = ? AND cli_msg_id = ? AND msg_type != \'recalled\'',
             [ownerZaloId, String(msgId)]
         );
-        const originalContent = existing?.content ?? null;
+        const originalContent = existing?.recalled_content ?? existing?.content ?? null;
+        const originalMsgType = existing?.recalled_msg_type || (existing?.msg_type !== 'recalled' ? existing?.msg_type : null);
 
-        const SQL = 'UPDATE messages SET is_recalled = 1, msg_type = "recalled", content = ?, recalled_content = ? WHERE owner_zalo_id = ? AND ';
+        const SQL = `UPDATE messages SET
+            is_recalled = 1,
+            status = 'recalled',
+            msg_type = 'recalled',
+            content = ?,
+            recalled_content = CASE WHEN recalled_content IS NULL OR recalled_content = '' THEN ? ELSE recalled_content END,
+            recalled_msg_type = CASE WHEN recalled_msg_type IS NULL OR recalled_msg_type = '' THEN ? ELSE recalled_msg_type END
+            WHERE owner_zalo_id = ? AND `;
         if (this.queryOne<any>('SELECT 1 FROM messages WHERE owner_zalo_id = ? AND msg_id = ?', [ownerZaloId, String(msgId)])) {
-            this.run(SQL + `msg_id = ?`, [recalledContent, originalContent, ownerZaloId, String(msgId)]);
+            this.run(SQL + `msg_id = ?`, [recalledContent, originalContent, originalMsgType, ownerZaloId, String(msgId)]);
         } else {
-            this.run(SQL + `cli_msg_id = ? AND msg_type != 'recalled'`, [recalledContent, originalContent, ownerZaloId, String(msgId)]);
+            this.run(SQL + `cli_msg_id = ? AND msg_type != 'recalled'`, [recalledContent, originalContent, originalMsgType, ownerZaloId, String(msgId)]);
         }
     }
 
@@ -6307,9 +6422,10 @@ class DatabaseService {
     // ─── Analytics / Reporting ────────────────────────────────────────────────
 
     /**
-     * Per-account overview: tổng tin nhắn, contacts, groups cho 1 account
+     * Per-account overview scoped to the date and conversation filters selected
+     * in Reports. It must never silently count the whole message archive.
      */
-    public getDashboardOverview(zaloId: string): {
+    public getDashboardOverview(zaloId: string, sinceTs?: number, untilTs?: number, threadType?: number): {
         totalMessages: number; totalSent: number; totalReceived: number;
         totalContacts: number; totalFriends: number; totalGroups: number;
         todayMessages: number; todaySent: number; todayReceived: number;
@@ -6325,18 +6441,24 @@ class DatabaseService {
             const todayEnd = new Date(now.getFullYear(), now.getMonth(), now.getDate(), 23, 59, 59, 999).getTime();
             const yesterdayStart = todayStart - 86400000;
             const yesterdayEnd = todayStart - 1;
-
-            const msgRow = this.queryOne<any>(
-                `SELECT COUNT(*) as total, COALESCE(SUM(CASE WHEN is_sent=1 THEN 1 ELSE 0 END),0) as sent FROM messages WHERE owner_zalo_id = ?`,
-                [zaloId]
+            const rangeStart = Number.isFinite(sinceTs) ? Number(sinceTs) : todayStart;
+            const rangeEnd = Number.isFinite(untilTs) ? Number(untilTs) : todayEnd;
+            const threadFilter = threadType !== undefined && threadType !== -1 ? ' AND thread_type = ?' : '';
+            const threadParams = threadFilter ? [threadType] : [];
+            const periodRow = this.queryOne<any>(
+                `SELECT COUNT(*) AS total,
+                        COALESCE(SUM(CASE WHEN is_sent = 1 THEN 1 ELSE 0 END), 0) AS sent
+                 FROM messages
+                 WHERE owner_zalo_id = ? AND timestamp >= ? AND timestamp <= ?${threadFilter}`,
+                [zaloId, rangeStart, rangeEnd, ...threadParams],
             );
             const todayRow = this.queryOne<any>(
-                `SELECT COUNT(*) as total, COALESCE(SUM(CASE WHEN is_sent=1 THEN 1 ELSE 0 END),0) as sent FROM messages WHERE owner_zalo_id = ? AND timestamp >= ? AND timestamp <= ?`,
-                [zaloId, todayStart, todayEnd]
+                `SELECT COUNT(*) as total, COALESCE(SUM(CASE WHEN is_sent=1 THEN 1 ELSE 0 END),0) as sent FROM messages WHERE owner_zalo_id = ? AND timestamp >= ? AND timestamp <= ?${threadFilter}`,
+                [zaloId, todayStart, todayEnd, ...threadParams]
             );
             const yestRow = this.queryOne<any>(
-                `SELECT COUNT(*) as total FROM messages WHERE owner_zalo_id = ? AND timestamp >= ? AND timestamp <= ?`,
-                [zaloId, yesterdayStart, yesterdayEnd]
+                `SELECT COUNT(*) as total FROM messages WHERE owner_zalo_id = ? AND timestamp >= ? AND timestamp <= ?${threadFilter}`,
+                [zaloId, yesterdayStart, yesterdayEnd, ...threadParams]
             );
             const contactRow = this.queryOne<any>(
                 `SELECT COUNT(*) as cnt FROM contacts WHERE owner_zalo_id = ? AND contact_type != 'group'`,
@@ -6356,9 +6478,9 @@ class DatabaseService {
             );
 
             return {
-                totalMessages: msgRow?.total || 0,
-                totalSent: msgRow?.sent || 0,
-                totalReceived: (msgRow?.total || 0) - (msgRow?.sent || 0),
+                totalMessages: periodRow?.total || 0,
+                totalSent: periodRow?.sent || 0,
+                totalReceived: (periodRow?.total || 0) - (periodRow?.sent || 0),
                 totalContacts: contactRow?.cnt || 0,
                 totalFriends: friendRow?.cnt || 0,
                 totalGroups: groupRow?.cnt || 0,
@@ -6463,106 +6585,76 @@ class DatabaseService {
         const empty = { avgSeconds: 0, medianSeconds: 0, minSeconds: 0, maxSeconds: 0, totalConversations: 0, totalReplies: 0, distribution: [], byHour: [] };
         if (!this.initialized || !zaloId) return empty;
         try {
-            // Determine thread_type filter: default to 0 (1-to-1) unless explicitly set
             const ttFilter = threadType !== undefined && threadType !== -1 ? threadType : 0;
-            // Get messages in the date range, ordered by thread + time
-            const msgs = this.query<any>(
-                `SELECT thread_id, is_sent, timestamp
-                 FROM messages
-                 WHERE owner_zalo_id = ? AND thread_type = ? AND timestamp >= ? AND timestamp <= ?
-                 ORDER BY thread_id, timestamp ASC`,
-                [zaloId, ttFilter, sinceTs, untilTs]
-            );
+            // Keep aggregation inside SQLite.  The former implementation copied
+            // every message in the selected period into V8 and built large JS
+            // arrays before returning a small summary.  At millions of messages
+            // that can exhaust Electron's main-process heap.
+            const repliesCte = `
+                WITH ordered AS (
+                    SELECT thread_id, is_sent, timestamp, id,
+                        COALESCE(SUM(CASE WHEN is_sent = 1 THEN 1 ELSE 0 END) OVER (
+                            PARTITION BY thread_id ORDER BY timestamp ASC, id ASC
+                            ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING
+                        ), 0) AS sent_before
+                    FROM messages
+                    WHERE owner_zalo_id = ? AND thread_type = ?
+                      AND timestamp >= ? AND timestamp <= ?
+                ), matched AS (
+                    SELECT thread_id, is_sent, timestamp AS reply_ts,
+                        MAX(CASE WHEN is_sent = 0 THEN timestamp END) OVER (
+                            PARTITION BY thread_id, sent_before
+                        ) AS incoming_ts
+                    FROM ordered
+                ), replies AS (
+                    SELECT thread_id, reply_ts, incoming_ts, reply_ts - incoming_ts AS gap_ms
+                    FROM matched
+                    WHERE is_sent = 1 AND incoming_ts IS NOT NULL
+                      AND reply_ts >= incoming_ts
+                      AND reply_ts - incoming_ts < 604800000
+                )`;
+            const queryParams = [zaloId, ttFilter, sinceTs, untilTs];
+            const stats = this.queryOne<any>(`${repliesCte}
+                SELECT COUNT(*) AS total_replies,
+                    COUNT(DISTINCT thread_id) AS total_threads,
+                    COALESCE(AVG(gap_ms), 0) AS avg_ms,
+                    COALESCE(MIN(gap_ms), 0) AS min_ms,
+                    COALESCE(MAX(gap_ms), 0) AS max_ms,
+                    COALESCE(SUM(CASE WHEN gap_ms < 60000 THEN 1 ELSE 0 END), 0) AS b0,
+                    COALESCE(SUM(CASE WHEN gap_ms >= 60000 AND gap_ms < 300000 THEN 1 ELSE 0 END), 0) AS b1,
+                    COALESCE(SUM(CASE WHEN gap_ms >= 300000 AND gap_ms < 900000 THEN 1 ELSE 0 END), 0) AS b2,
+                    COALESCE(SUM(CASE WHEN gap_ms >= 900000 AND gap_ms < 1800000 THEN 1 ELSE 0 END), 0) AS b3,
+                    COALESCE(SUM(CASE WHEN gap_ms >= 1800000 AND gap_ms < 3600000 THEN 1 ELSE 0 END), 0) AS b4,
+                    COALESCE(SUM(CASE WHEN gap_ms >= 3600000 AND gap_ms < 7200000 THEN 1 ELSE 0 END), 0) AS b5,
+                    COALESCE(SUM(CASE WHEN gap_ms >= 7200000 AND gap_ms < 14400000 THEN 1 ELSE 0 END), 0) AS b6,
+                    COALESCE(SUM(CASE WHEN gap_ms >= 14400000 AND gap_ms < 43200000 THEN 1 ELSE 0 END), 0) AS b7,
+                    COALESCE(SUM(CASE WHEN gap_ms >= 43200000 AND gap_ms < 86400000 THEN 1 ELSE 0 END), 0) AS b8,
+                    COALESCE(SUM(CASE WHEN gap_ms >= 86400000 THEN 1 ELSE 0 END), 0) AS b9
+                FROM replies`, queryParams);
+            const totalReplies = Number(stats?.total_replies || 0);
+            if (!totalReplies) return empty;
 
-            if (msgs.length === 0) return empty;
-
-            // Group by thread and find response gaps
-            const gaps: number[] = [];
-            const hourGaps: Map<number, number[]> = new Map();
-            const threadsSeen = new Set<string>();
-
-            let prevThreadId: string | null = null;
-            let lastIncomingTs: number | null = null;
-
-            for (const m of msgs) {
-                if (m.thread_id !== prevThreadId) {
-                    // New thread
-                    prevThreadId = m.thread_id;
-                    lastIncomingTs = null;
-                }
-
-                if (m.is_sent === 0) {
-                    // Incoming message - record timestamp (always take the latest unanswered incoming)
-                    lastIncomingTs = m.timestamp;
-                } else if (m.is_sent === 1 && lastIncomingTs !== null) {
-                    // Outgoing message after an incoming one - this is a reply
-                    const gapMs = m.timestamp - lastIncomingTs;
-                    if (gapMs >= 0 && gapMs < 7 * 86400000) {
-                        // Only count replies within 7 days (ignore stale threads)
-                        const gapSec = Math.round(gapMs / 1000);
-                        gaps.push(gapSec);
-                        threadsSeen.add(m.thread_id);
-
-                        // Group by hour of the incoming message
-                        const hour = new Date(lastIncomingTs).getHours();
-                        if (!hourGaps.has(hour)) hourGaps.set(hour, []);
-                        hourGaps.get(hour)!.push(gapSec);
-                    }
-                    lastIncomingTs = null; // Reset - this reply consumed the incoming
-                }
-            }
-
-            if (gaps.length === 0) return empty;
-
-            // Sort for median/min/max
-            gaps.sort((a, b) => a - b);
-            const sum = gaps.reduce((s, v) => s + v, 0);
-            const avgSeconds = Math.round(sum / gaps.length);
-            const medianSeconds = gaps[Math.floor(gaps.length / 2)];
-            const minSeconds = gaps[0];
-            const maxSeconds = gaps[gaps.length - 1];
-
-            // Distribution buckets
-            const bucketDefs: Array<{ label: string; maxSec: number }> = [
-                { label: '< 1 phút', maxSec: 60 },
-                { label: '1–5 phút', maxSec: 300 },
-                { label: '5–15 phút', maxSec: 900 },
-                { label: '15–30 phút', maxSec: 1800 },
-                { label: '30–60 phút', maxSec: 3600 },
-                { label: '1–2 giờ', maxSec: 7200 },
-                { label: '2–4 giờ', maxSec: 14400 },
-                { label: '4–12 giờ', maxSec: 43200 },
-                { label: '12–24 giờ', maxSec: 86400 },
-                { label: '> 24 giờ', maxSec: Infinity },
-            ];
-            const distribution = bucketDefs.map(b => ({ bucket: b.label, count: 0 }));
-            for (const g of gaps) {
-                for (let i = 0; i < bucketDefs.length; i++) {
-                    if (g < bucketDefs[i].maxSec || i === bucketDefs.length - 1) {
-                        distribution[i].count++;
-                        break;
-                    }
-                }
-            }
-
-            // By hour of day
-            const byHour: Array<{ hour: number; avgSeconds: number; count: number }> = [];
-            for (let h = 0; h < 24; h++) {
-                const hGaps = hourGaps.get(h) || [];
-                byHour.push({
-                    hour: h,
-                    avgSeconds: hGaps.length > 0 ? Math.round(hGaps.reduce((s, v) => s + v, 0) / hGaps.length) : 0,
-                    count: hGaps.length,
-                });
-            }
+            const median = this.queryOne<any>(`${repliesCte}
+                SELECT gap_ms FROM replies ORDER BY gap_ms ASC LIMIT 1 OFFSET ?`, [...queryParams, Math.floor(totalReplies / 2)]);
+            const hourRows = this.query<any>(`${repliesCte}
+                SELECT CAST(strftime('%H', incoming_ts / 1000, 'unixepoch', 'localtime') AS INTEGER) AS hour,
+                    COUNT(*) AS count, AVG(gap_ms) AS avg_ms
+                FROM replies GROUP BY hour`, queryParams);
+            const hourMap = new Map(hourRows.map((row: any) => [Number(row.hour), row]));
+            const byHour = Array.from({ length: 24 }, (_value, hour) => {
+                const row = hourMap.get(hour);
+                return { hour, avgSeconds: row ? Math.round(Number(row.avg_ms) / 1000) : 0, count: Number(row?.count || 0) };
+            });
+            const labels = ['< 1 phút', '1–5 phút', '5–15 phút', '15–30 phút', '30–60 phút', '1–2 giờ', '2–4 giờ', '4–12 giờ', '12–24 giờ', '> 24 giờ'];
+            const distribution = labels.map((bucket, index) => ({ bucket, count: Number(stats?.[`b${index}`] || 0) }));
 
             return {
-                avgSeconds,
-                medianSeconds,
-                minSeconds,
-                maxSeconds,
-                totalConversations: threadsSeen.size,
-                totalReplies: gaps.length,
+                avgSeconds: Math.round(Number(stats.avg_ms || 0) / 1000),
+                medianSeconds: Math.round(Number(median?.gap_ms || 0) / 1000),
+                minSeconds: Math.round(Number(stats.min_ms || 0) / 1000),
+                maxSeconds: Math.round(Number(stats.max_ms || 0) / 1000),
+                totalConversations: Number(stats.total_threads || 0),
+                totalReplies,
                 distribution,
                 byHour,
             };
@@ -6680,21 +6772,18 @@ class DatabaseService {
         try {
             const threadFilter = threadType !== undefined && threadType !== -1 ? ' AND thread_type = ?' : '';
             const threadParams = threadType !== undefined && threadType !== -1 ? [threadType] : [];
+            // Return the fixed 7×24 aggregate, never one IPC object per message.
             const rows = this.query<any>(
-                `SELECT timestamp FROM messages WHERE owner_zalo_id = ? AND timestamp >= ? AND timestamp <= ?${threadFilter}`,
+                `SELECT
+                    (CAST(strftime('%w', timestamp / 1000, 'unixepoch', 'localtime') AS INTEGER) + 6) % 7 AS day_of_week,
+                    CAST(strftime('%H', timestamp / 1000, 'unixepoch', 'localtime') AS INTEGER) AS hour,
+                    COUNT(*) AS count
+                 FROM messages
+                 WHERE owner_zalo_id = ? AND timestamp >= ? AND timestamp <= ?${threadFilter}
+                 GROUP BY day_of_week, hour`,
                 [zaloId, sinceTs, untilTs, ...threadParams]
             );
-            // Build 7×24 grid
-            const grid = new Map<string, number>();
-            for (const r of rows) {
-                const d = new Date(r.timestamp);
-                const dow = d.getDay(); // 0=Sun, 1=Mon, ...6=Sat
-                // Convert to Mon=0 ... Sun=6
-                const dowMon = dow === 0 ? 6 : dow - 1;
-                const hour = d.getHours();
-                const key = `${dowMon}_${hour}`;
-                grid.set(key, (grid.get(key) || 0) + 1);
-            }
+            const grid = new Map(rows.map((row: any) => [`${row.day_of_week}_${row.hour}`, Number(row.count)]));
             const result: Array<{ dayOfWeek: number; hour: number; count: number }> = [];
             for (let d = 0; d < 7; d++) {
                 for (let h = 0; h < 24; h++) {
@@ -8066,23 +8155,31 @@ class DatabaseService {
         emoji?: string; participant_count: number; last_message_preview?: string;
         last_message_at?: number; unread_count: number; is_muted: number;
         is_e2ee?: number;
-    }): void {
+        metadata?: Record<string, any>;
+    }, options?: { preserveUnread?: boolean }): void {
         const now = Date.now();
+        const metadata = thread.metadata && Object.keys(thread.metadata).length > 0
+            ? JSON.stringify(thread.metadata)
+            : null;
         this.run(`
             INSERT INTO fb_threads (id, account_id, name, type, emoji, participant_count,
-                last_message_preview, last_message_at, unread_count, is_muted, is_e2ee, synced_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                last_message_preview, last_message_at, unread_count, is_muted, is_e2ee, metadata, synced_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
-              name = excluded.name, type = excluded.type, emoji = excluded.emoji,
+              name = CASE WHEN excluded.name != '' THEN excluded.name ELSE fb_threads.name END,
+              type = excluded.type, emoji = excluded.emoji,
               participant_count = excluded.participant_count,
               last_message_preview = excluded.last_message_preview,
               last_message_at = excluded.last_message_at,
+              unread_count = ${options?.preserveUnread ? 'fb_threads.unread_count' : 'excluded.unread_count'},
+              is_muted = ${options?.preserveUnread ? 'fb_threads.is_muted' : 'excluded.is_muted'},
               is_e2ee = CASE WHEN excluded.is_e2ee = 1 THEN 1 ELSE fb_threads.is_e2ee END,
+              metadata = CASE WHEN excluded.metadata IS NOT NULL AND excluded.metadata != '' THEN excluded.metadata ELSE fb_threads.metadata END,
               synced_at = excluded.synced_at
         `, [thread.id, thread.account_id, thread.name, thread.type, thread.emoji || null,
             thread.participant_count, thread.last_message_preview || null,
             thread.last_message_at || null, thread.unread_count, thread.is_muted,
-            thread.is_e2ee ?? 0, now]);
+            thread.is_e2ee ?? 0, metadata, now]);
     }
 
     /** Đánh dấu thread là E2EE-encrypted */
@@ -8098,7 +8195,12 @@ class DatabaseService {
         return rows.map(r => r.id);
     }
 
-    public saveFBThreads(accountId: string, threads: any[]): void {
+    /**
+     * Save Facebook threads. Bridge history has no read-state field, so it may
+     * refresh names/messages but must preserve local unread state until the
+     * GraphQL inbox returns an authoritative count.
+     */
+    public saveFBThreads(accountId: string, threads: any[], options?: { preserveUnread?: boolean }): void {
         // Resolve facebook_id (numeric UID) for unified contacts table
         // accountId here is internal UUID, but contacts.owner_zalo_id uses facebook_id
         let ownerZaloId = accountId;
@@ -8114,7 +8216,9 @@ class DatabaseService {
                 last_message_preview: t.last_message_preview,
                 last_message_at: t.last_message_at, unread_count: t.unread_count || 0,
                 is_muted: t.is_muted ? 1 : 0,
-            });
+                is_e2ee: t.is_e2ee,
+                metadata: t.metadata,
+            }, options);
             const avatarUrl = t.metadata?.avatar_url || '';
             // Sync to unified contacts table - use facebook_id as owner_zalo_id
             this.run(`
@@ -8130,7 +8234,7 @@ class DatabaseService {
                   contact_type = excluded.contact_type,
                   last_message = CASE WHEN excluded.last_message_time > COALESCE(contacts.last_message_time, 0) THEN excluded.last_message ELSE contacts.last_message END,
                   last_message_time = MAX(COALESCE(contacts.last_message_time, 0), excluded.last_message_time),
-                  unread_count = excluded.unread_count,
+                  unread_count = ${options?.preserveUnread ? 'contacts.unread_count' : 'excluded.unread_count'},
                   channel = 'facebook'
             `, [ownerZaloId, t.id, t.name || '', avatarUrl, t.type === 'group' ? 'group' : 'user',
                 t.unread_count || 0, t.last_message_preview || '', t.last_message_at || 0]);
@@ -8161,8 +8265,22 @@ class DatabaseService {
         sender_name?: string; body?: string; timestamp: number; type: string;
         attachments?: string; reply_to_id?: string; is_self: number; is_unsent: number;
         reactions?: string;
+        /** Historical backfill must never create a new unread notification. */
+        is_history?: boolean;
     }): void {
         const now = Date.now();
+        // `INSERT OR IGNORE` below makes message persistence idempotent, but
+        // the preview/contact work used to run even when the row already
+        // existed. Replayed MQTT events then produced a second unread badge.
+        let isNewMessage = true;
+        try {
+            isNewMessage = !this.queryOne<{ id: string }>(
+                `SELECT id FROM fb_messages WHERE id = ? AND account_id = ? LIMIT 1`,
+                [msg.id, msg.account_id],
+            );
+        } catch (err: any) {
+            Logger.warn(`[DB:saveFBMessage] Could not check duplicate message: ${err.message}`);
+        }
         Logger.log(`[DB:saveFBMessage] id=${msg.id} account_id=${msg.account_id} thread_id=${msg.thread_id} sender=${msg.sender_id} is_self=${msg.is_self} type=${msg.type} body="${(msg.body || '').slice(0,50)}" reply_to_id=${msg.reply_to_id || '(none)'}`);
         if (msg.type === 'sticker') {
           Logger.log(`[DB:saveFBMessage] [STICKER] Saving sticker msg: id=${msg.id} thread_id=${msg.thread_id} attachments=${(msg.attachments || '').slice(0,200)}`);
@@ -8242,8 +8360,11 @@ class DatabaseService {
             msg.is_self, msg.attachments || '[]', msg.is_self ? 'sent' : 'received',
             msg.reply_to_id || null, quoteData || null]);
 
-        // Update thread preview + contacts (unified conversation list)
-        if (!msg.is_unsent) {
+        // Update thread preview + contacts (unified conversation list).
+        // A bridge/API history sync calls this method to persist old rows too;
+        // those rows are not new notifications and must not re-increment unread
+        // counts every time the application starts.
+        if (!msg.is_unsent && !msg.is_history && isNewMessage) {
             const lastMsgPreview = msg.body?.slice(0, 200) || (msg.type === 'image' ? '🖼️ Hình ảnh' : msg.type === 'video' ? '🎬 Video' : msg.type === 'audio' ? '🎵 Audio' : msg.type === 'sticker' ? '🎨 Sticker' : '[Tệp đính kèm]');
             this.run(`
                 UPDATE fb_threads SET last_message_preview = ?, last_message_at = ?,
@@ -8266,8 +8387,9 @@ class DatabaseService {
                 // try to resolve from existing contacts table
                 if (!threadName && contactType === 'user') {
                     const existing = this.queryOne<any>(
-                        `SELECT display_name FROM contacts WHERE contact_id = ? AND channel = 'facebook' AND display_name != '' LIMIT 1`,
-                        [msg.thread_id]
+                        `SELECT display_name FROM contacts
+                         WHERE owner_zalo_id = ? AND contact_id = ? AND channel = 'facebook' AND display_name != '' LIMIT 1`,
+                        [ownerZaloId, msg.thread_id]
                     );
                     if (existing?.display_name) threadName = existing.display_name;
                 }

@@ -48,7 +48,10 @@ import Logger from '../../utils/Logger';
 const REQUIRED_PROTOCOL_VERSION = 2;
 
 /** Allowed bridge versions (semver prefix match) */
-const ALLOWED_BRIDGE_VERSIONS = ['2.3.1'];
+// Protocol v2 plus the capability handshake is the compatibility contract.
+// Accept the maintained fbchat-v2 2.3.1/2.3.2 bridge lines; a future minor
+// version still needs an explicit review here.
+const ALLOWED_BRIDGE_VERSIONS = ['2.3.1', '2.3.2'];
 
 /** Max single JSON frame size (encoded) — 40 MiB */
 const MAX_JSON_FRAME_BYTES = 40 * 1024 * 1024;
@@ -65,6 +68,8 @@ export const BRIDGE_METHODS = [
   'newClient',
   'connect',
   'connectE2EE',
+  'syncHistory',
+  'getUserInfo',
   'isConnected',
   'disconnect',
   'sendMessage',
@@ -100,6 +105,37 @@ export interface BridgeHello {
   bridgeVersion: string;
   capabilities: string[];
   maxDecodedMediaBytes: number;
+}
+
+export interface BridgeContactInfo {
+  id: string | number;
+  name: string;
+  firstName?: string;
+  username?: string;
+  profilePictureUrl?: string;
+  isMessengerUser?: boolean;
+  isVerified?: boolean;
+  canViewerMessage?: boolean;
+}
+
+/** Recent inbox data returned by the bridge. It is persisted, never replayed as live events. */
+export interface BridgeInitialData {
+  threads?: Array<{
+    id: string | number;
+    type?: number;
+    name?: string;
+    lastActivityTimestampMs?: number;
+    snippet?: string;
+  }>;
+  messages?: Array<{
+    id: string;
+    threadId: string | number;
+    senderId?: string | number;
+    text?: string | null;
+    timestampMs?: number;
+    attachments?: any[];
+    replyTo?: { messageId?: string };
+  }>;
 }
 
 export interface NativeLoginField {
@@ -599,6 +635,10 @@ export class FacebookE2EEBridge extends EventEmitter {
     return this.helloData;
   }
 
+  public supportsCapability(capability: string): boolean {
+    return this.helloData?.capabilities.includes(capability) === true;
+  }
+
   // ─── Connection Sequence ──────────────────────────────────────────────────
 
   /**
@@ -641,10 +681,20 @@ export class FacebookE2EEBridge extends EventEmitter {
    * Bridge may respond with { ok: true } without data - handle gracefully.
    * @returns User info (id, name) or empty if not provided
    */
-  public async connect(timeout: number = 120000): Promise<{ user?: { id: string; name?: string } }> {
+  public async connect(timeout: number = 120000): Promise<{ user?: { id: string; name?: string }; initialData?: BridgeInitialData }> {
     const result = await this.call('connect', undefined, timeout);
     // Bridge may respond with just { ok: true } and no data field
     return (result as any) || {};
+  }
+
+  /** Reload recent bridge history without treating it as live traffic. */
+  public async syncHistory(timeout: number = 60000): Promise<BridgeInitialData> {
+    return this.call('syncHistory', undefined, timeout);
+  }
+
+  /** Resolve a Messenger contact through the bridge's GetContactsFull task. */
+  public async getUserInfo(userId: string): Promise<BridgeContactInfo> {
+    return this.call('getUserInfo', { userId: String(userId) }, 30000);
   }
 
   /**

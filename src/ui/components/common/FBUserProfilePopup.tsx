@@ -44,7 +44,7 @@ export function FBUserProfilePopup({ userId, anchorX, anchorY, contacts, activeA
     const hasAvatar = userInfo?.avatar_url;
     if (hasName && hasAvatar) return;
     if (!activeAccountId || !/^\d+$/.test(userId)) return;
-    ipc.fb?.getUserInfoFacebookHtml({ accountId: activeAccountId, userId })
+    ipc.fb?.getUserInfoFacebook({ accountId: activeAccountId, userId })
       .then(res => {
         if (res.success && (res.name || res.avatarUrl)) {
           const patch: any = {};

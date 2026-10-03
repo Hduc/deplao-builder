@@ -22,6 +22,42 @@ class EventBroadcaster {
     private static beforeSendHooks: Map<string, Array<(data: any) => void>> = new Map();
 
     /**
+     * Some Zalo clients surface an undo control payload on the ordinary
+     * `message`/`old_messages` stream as well as the dedicated `undo` stream.
+     * It is metadata, never a chat message, and must not be persisted as a
+     * JSON text bubble.
+     */
+    private static getUndoControlPayload(message: any): { msgId: string; threadId: string } | null {
+        const data = message?.data || message || {};
+        const candidates = [data?.content, message?.content, data];
+
+        for (const rawCandidate of candidates) {
+            let payload = rawCandidate;
+            if (typeof payload === 'string') {
+                try { payload = JSON.parse(payload); } catch { continue; }
+            }
+            if (!payload || typeof payload !== 'object' || Array.isArray(payload)) continue;
+
+            const msgId = payload.globalMsgId || payload.cliMsgId || '';
+            const hasUndoSignature = !!msgId && (
+                Object.prototype.hasOwnProperty.call(payload, 'deleteMsg') ||
+                Object.prototype.hasOwnProperty.call(payload, 'srcId') ||
+                Object.prototype.hasOwnProperty.call(payload, 'destId')
+            );
+            if (!hasUndoSignature) continue;
+
+            // `srcId` can be an internal sender object, not a conversation ID.
+            // Prefer the listener-normalized threadId and only use explicit
+            // thread fields as fallbacks.
+            return {
+                msgId: String(msgId),
+                threadId: String(message?.threadId || data?.threadId || data?.idTo || ''),
+            };
+        }
+        return null;
+    }
+
+    /**
      * Pre-seed the settings cache for a group so the FIRST update_setting event
      * can diff against a known baseline.  Call this BEFORE invoking updateGroupSettings.
      */
@@ -247,6 +283,13 @@ class EventBroadcaster {
      */
     public static async broadcastMessage(zaloId: string, message: any, options?: { silent?: boolean; fromRelay?: boolean }): Promise<void> {
         try {
+            const undoControl = this.getUndoControlPayload(message);
+            if (undoControl) {
+                Logger.log(`[EventBroadcaster] Detected undo control payload on message stream: recalled msgId=${undoControl.msgId} threadId=${undoControl.threadId || '-'} source=${options?.silent ? 'history' : 'realtime'}`);
+                this.broadcastUndo(zaloId, undoControl.msgId, undoControl.threadId);
+                return;
+            }
+
             // ─── Resolve the correct DB path for saving ───────────────────────
             // Boss webhook (fromRelay=false): ALWAYS save to the default workspace DB.
             // This ensures the boss DB (source of truth) gets every message,
@@ -579,6 +622,20 @@ class EventBroadcaster {
                         DatabaseService.getInstance().updateContactProfile(zaloId, groupId, groupName, groupAvt);
                         Logger.log(`[EventBroadcaster] Saved group profile: ${groupId} → ${groupName}`);
                     }
+                }
+            }
+
+            // Group information is normally cached as a contact. Surface that
+            // name on the event itself so every consumer, including workflow
+            // templates, gets the same context even when Zalo omits it from a
+            // message payload.
+            if (message.type === 1 && !message.groupName) {
+                const groupId = String(message.threadId || '');
+                const cachedName = groupId
+                    ? String(DatabaseService.getInstance().getContactById(zaloId, groupId)?.display_name || '')
+                    : '';
+                if (cachedName && cachedName !== groupId && !/^\d+$/.test(cachedName)) {
+                    message.groupName = cachedName;
                 }
             }
 

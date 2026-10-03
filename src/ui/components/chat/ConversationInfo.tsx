@@ -147,7 +147,7 @@ function UserConversationInfo() {
         .catch(() => {});
     } else if (isFacebook(channel)) {
       Promise.all([
-        ipc.fb?.getUserInfoFacebookHtml({ accountId: activeAccountId, userId: activeThreadId }) || Promise.resolve(null),
+        ipc.fb?.getUserInfoFacebook({ accountId: activeAccountId, userId: activeThreadId }) || Promise.resolve(null),
         /^\d+$/.test(activeThreadId)
           ? (ipc.fb?.refreshContactAvatar({ accountId: activeAccountId, userId: activeThreadId }) || Promise.resolve(null))
           : Promise.resolve(null),
@@ -376,7 +376,7 @@ function UserConversationInfo() {
       } else {
         // Facebook / other: refresh thông tin user từ profile HTML + reload alias từ DB
         // FB: refresh tên + avatar từ profile HTML
-        const fbRes = await ipc.fb?.getUserInfoFacebookHtml({ accountId: activeAccountId, userId: activeThreadId });
+        const fbRes = await ipc.fb?.getUserInfoFacebook({ accountId: activeAccountId, userId: activeThreadId });
         if (fbRes?.success && (fbRes.name || fbRes.avatarUrl)) {
           const patch: any = { contact_id: activeThreadId };
           if (fbRes.name) patch.display_name = fbRes.name;

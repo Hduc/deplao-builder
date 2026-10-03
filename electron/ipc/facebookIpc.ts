@@ -4,11 +4,11 @@
  * Pattern: ipcMain.handle('fb:channel', async (_event, params) => { ... })
  */
 
-import { ipcMain } from 'electron';
+import { ipcMain, type IpcMainInvokeEvent } from 'electron';
 import { v4 as uuid } from 'uuid';
 import DatabaseService from '../../src/services/database/DatabaseService';
 import FacebookConnectionManager from '../../src/utils/FacebookConnectionManager';
-import { initSession, fetchBasicProfileFromHome, fetchFBHomepage, getUserInfoFacebookHtml } from '../../src/services/facebook/FacebookSession';
+import { initSession, fetchBasicProfileFromHome, fetchFBHomepage } from '../../src/services/facebook/FacebookSession';
 import { loginWithCredentials } from '../../src/services/facebook/FacebookLoginHelper';
 import { secureGet, secureSet, secureDelete } from '../../src/services/secure/SecureSettingsService';
 import FacebookE2EEBridge, { NativeLoginResult } from '../../src/services/facebook/FacebookE2EEBridge';
@@ -124,6 +124,88 @@ async function getFBServiceOrReconnect(internalId: string): Promise<FacebookServ
     Logger.warn(`[facebookIpc] Auto-reconnect failed for ${internalId}: ${err.message}`);
     return null;
   }
+}
+
+type FacebookConnectSource = 'dashboard' | 'startup' | 'startup-retry';
+
+/**
+ * Connect one account through the same path for the dashboard and automatic
+ * startup. Do not add a separate cookie-health preflight here: creating a
+ * FacebookService already validates the cookie with the account proxy, and a
+ * duplicate homepage request used to leave startup waiting for up to a minute
+ * before the MQTT/E2EE listeners were even created.
+ */
+async function connectFacebookAccount(
+  internalId: string,
+  source: FacebookConnectSource,
+): Promise<{ service: FacebookService; listenerConnected: boolean; e2eeConnected: boolean }> {
+  const db = DatabaseService.getInstance();
+  const account = db.getFBAccount(internalId);
+  if (!account) throw new Error('Account not found');
+
+  const cookie = secureGet(fbCookieKey(internalId)) || account.cookie_encrypted;
+  if (!cookie) throw new Error('No cookie found for this account');
+
+  let proxyId: number | null | undefined;
+  try {
+    const accRow = db.queryOne<any>(
+      'SELECT proxy_id FROM accounts WHERE zalo_id = ?',
+      [account.facebook_id || internalId],
+    );
+    proxyId = accRow?.proxy_id ?? null;
+  } catch {
+    proxyId = null;
+  }
+
+  Logger.log(`[facebookIpc] ${source} ${internalId}: starting Facebook session`);
+  const service = await FacebookConnectionManager.getOrCreate(internalId, cookie, proxyId);
+
+  // FacebookService.connect() starts MQTT asynchronously. Waiting here is what
+  // makes automatic reconnect equivalent to dashboard reconnect, instead of
+  // logging success while the socket is still dead.
+  const ready = await service.ensureConnected();
+  const listenerConnected = service.isListenerActuallyConnected();
+  const e2eeConnected = service.isE2EEConnected();
+  if (!ready) {
+    throw new Error('Facebook listener chưa sẵn sàng sau khi kết nối. Hệ thống sẽ tự thử lại.');
+  }
+
+  service.resetListenerRetryCount?.();
+  db.setListenerActive(account.facebook_id || internalId, true);
+  Logger.log(
+    `[facebookIpc] ${source} ${internalId}: ready ` +
+    `(mqtt=${listenerConnected}, e2ee=${e2eeConnected})`,
+  );
+  return { service, listenerConnected, e2eeConnected };
+}
+
+const FB_STARTUP_RETRY_DELAYS_MS = [15_000, 60_000, 180_000];
+const fbStartupRetryTimers = new Map<string, ReturnType<typeof setTimeout>>();
+
+function clearFacebookStartupRetry(accountId: string): void {
+  const timer = fbStartupRetryTimers.get(accountId);
+  if (timer) clearTimeout(timer);
+  fbStartupRetryTimers.delete(accountId);
+}
+
+function scheduleFacebookStartupRetry(accountId: string, failedAttempt: number): void {
+  if (failedAttempt >= FB_STARTUP_RETRY_DELAYS_MS.length || fbStartupRetryTimers.has(accountId)) return;
+  const delay = FB_STARTUP_RETRY_DELAYS_MS[failedAttempt];
+  Logger.warn(
+    `[facebookIpc] startup ${accountId}: retrying in ${Math.round(delay / 1000)}s ` +
+    `(attempt ${failedAttempt + 2}/${FB_STARTUP_RETRY_DELAYS_MS.length + 1})`,
+  );
+  const timer = setTimeout(() => {
+    fbStartupRetryTimers.delete(accountId);
+    connectFacebookAccount(accountId, 'startup-retry')
+      .then(() => clearFacebookStartupRetry(accountId))
+      .catch((err: any) => {
+        Logger.warn(`[facebookIpc] startup retry ${accountId}: ${err?.message || err}`);
+        scheduleFacebookStartupRetry(accountId, failedAttempt + 1);
+      });
+  }, delay);
+  timer.unref?.();
+  fbStartupRetryTimers.set(accountId, timer);
 }
 
 // ─── Handlers ────────────────────────────────────────────────────────────────
@@ -490,35 +572,39 @@ export function registerFacebookIpc(): void {
     }
   });
 
-  /**
-   * Lấy thông tin user (tên + avatar) từ Facebook profile HTML
-   * Dùng cho E2EE / hội thoại mới không có contact info
-   */
-  ipcMain.handle('fb:getUserInfoFacebookHtml', async (_event, { accountId, userId }: { accountId: string; userId: string }) => {
+  /** Resolve a one-to-one Facebook identity by its numeric UID. */
+  const getUserInfoFacebookHandler = async (_event: IpcMainInvokeEvent, { accountId, userId }: { accountId: string; userId: string }) => {
     try {
       // Chỉ cho phép user ID dạng số (không phải group chat)
       if (!/^\d+$/.test(userId)) return { success: false, error: 'Chỉ hỗ trợ user 1-1' };
       const internalId = resolveInternalId(accountId);
-      const cookie = secureGet(fbCookieKey(internalId));
-      if (!cookie) return { success: false, error: 'Cookie not found' };
-      const info = await getUserInfoFacebookHtml(cookie, userId);
+      const service = await getFBServiceOrReconnect(internalId);
+      if (!service) return { success: false, error: 'Tài khoản chưa kết nối' };
+      const info = await service.getUserInfoFacebook(userId);
       if (info) {
-        Logger.log(`[facebookIpc] fb:getUserInfoFacebookHtml: resolved ${userId} → name="${info.name}"`);
-        // Lưu vào DB nếu có tên
+        Logger.log(`[facebookIpc] fb:getUserInfoFacebook: resolved ${userId} → name="${info.name}"`);
+        // Lưu dưới Facebook UID thật, không phải UUID nội bộ của account.
         if (info.name) {
           DatabaseService.getInstance()['run']?.(
-            `UPDATE contacts SET display_name = ?, avatar_url = ? WHERE owner_zalo_id = ? AND contact_id = ? AND channel = 'facebook'`,
-            [info.name, info.avatarUrl || null, internalId, userId]
+            `INSERT INTO contacts (owner_zalo_id, contact_id, display_name, avatar_url, is_friend, contact_type, unread_count, last_message, last_message_time, channel)
+             VALUES (?, ?, ?, ?, 0, 'user', 0, '', 0, 'facebook')
+             ON CONFLICT(owner_zalo_id, contact_id) DO UPDATE SET
+               display_name = excluded.display_name,
+               avatar_url = excluded.avatar_url`,
+            [resolveRealFacebookId(internalId, service), userId, info.name, info.avatarUrl || '']
           );
         }
         return { success: true, name: info.name, avatarUrl: info.avatarUrl };
       }
       return { success: false, error: 'Không thể lấy thông tin user' };
     } catch (err: any) {
-      Logger.error(`[facebookIpc] fb:getUserInfoFacebookHtml error: ${err.message}`);
+      Logger.error(`[facebookIpc] fb:getUserInfoFacebook error: ${err.message}`);
       return { success: false, error: err.message };
     }
-  });
+  };
+  ipcMain.handle('fb:getUserInfoFacebook', getUserInfoFacebookHandler);
+  // Kept so renderer bundles released before the IPC rename keep working.
+  ipcMain.handle('fb:getUserInfoFacebookHtml', getUserInfoFacebookHandler);
 
   /**
    * Lấy danh sách tài khoản FB
@@ -537,40 +623,14 @@ export function registerFacebookIpc(): void {
    */
   ipcMain.handle('fb:connect', async (_event, { accountId }: { accountId: string }) => {
     try {
-
       const internalId = resolveInternalId(accountId);
-      const account = DatabaseService.getInstance().getFBAccount(internalId);
-      if (!account) return { success: false, error: 'Account not found' };
-
-      // Đọc proxyId từ unified accounts table
-      let proxyId: number | null | undefined;
-      try {
-        const accRow = DatabaseService.getInstance().queryOne<any>('SELECT proxy_id FROM accounts WHERE zalo_id = ?', [account.facebook_id || accountId]);
-        proxyId = accRow?.proxy_id ?? null;
-      } catch { proxyId = null; }
-
-      // Test cookie health trước
-      const cookie = secureGet(fbCookieKey(internalId)) || account.cookie_encrypted;
-      if (!cookie) return { success: false, error: 'No cookie found for this account' };
-
-      try {
-        const { checkCookieAlive } = require('../../src/services/facebook/FacebookSession');
-        const alive = await checkCookieAlive(cookie);
-        if (!alive) return { success: false, error: 'Cookie đã hết hạn. Vui lòng đăng nhập lại Facebook và copy cookie mới.' };
-      } catch (healthErr: any) {
-        Logger.warn(`[facebookIpc] fb:connect health check failed: ${healthErr.message}, proceeding anyway`);
-      }
-
-      const service = await FacebookConnectionManager.getOrCreate(internalId, cookie, proxyId);
-
-      // Reset retry count để lần mất kết nối sau bắt đầu lại từ attempt 0
-      if (service.isConnected()) {
-        service.resetListenerRetryCount?.();
-        DatabaseService.getInstance().setListenerActive(account.facebook_id || internalId, true);
-        Logger.log(`[facebookIpc] fb:connect ${internalId}: connected + retry reset`);
-      }
-
-      return { success: true };
+      const result = await connectFacebookAccount(internalId, 'dashboard');
+      clearFacebookStartupRetry(internalId);
+      return {
+        success: true,
+        listenerConnected: result.listenerConnected,
+        e2eeConnected: result.e2eeConnected,
+      };
     } catch (err: any) {
       return { success: false, error: err.message };
     }
@@ -801,13 +861,22 @@ export function registerFacebookIpc(): void {
         return { success: true, threads: cached };
       }
 
-      // Refresh từ Facebook API
-      const service = FacebookConnectionManager.get(internalId);
+      // Refresh both sources. The bridge page contains E2EE/private threads
+      // that the legacy web GraphQL inbox does not consistently return.
+      const service = await getFBServiceOrReconnect(internalId);
       if (service && service.isConnected()) {
+        const history = await service.syncBridgeHistory();
         const threads = await service.getThreadList();
-        DatabaseService.getInstance().saveFBThreads(internalId, threads);
-        const updated = DatabaseService.getInstance().getFBThreads(internalId);
-        return { success: true, threads: updated };
+        const db = DatabaseService.getInstance();
+        db.saveFBThreads(internalId, threads);
+        // Correct rows that were previously populated with the account avatar.
+        // The repair uses Facebook's ID-bound /picture endpoint and only
+        // requests avatars that are blank or match the current account.
+        const repairedAvatars = await service.refreshSuspectThreadAvatars(
+          db.getFBThreads(internalId).map(thread => thread.id),
+        );
+        const updated = db.getFBThreads(internalId);
+        return { success: true, threads: updated, syncedMessages: history.messages, repairedAvatars };
       }
 
       return { success: true, threads: cached };
@@ -1004,11 +1073,7 @@ export function registerFacebookIpc(): void {
       const service = await getFBServiceOrReconnect(internalId);
       if (!service) return { success: false, error: 'Tài khoản chưa kết nối. Vui lòng kết nối lại Facebook.' };
 
-      if (params.enable) {
-        // E2EE is auto-started during connect - manual reconnect nếu cần
-        await service.disconnect();
-        await service.connect();
-      }
+      await service.setE2EEEnabled(params.enable);
       return { success: true };
     } catch (err: any) {
       return { success: false, error: err.message };
@@ -1151,22 +1216,44 @@ export function registerFacebookIpc(): void {
       // Lưu tin nhắn vào DB để dùng offline
       if (result.success && result.messages?.length) {
         const db = DatabaseService.getInstance();
+        const ownFacebookId = String(resolveRealFacebookId(internalId, service)).replace(/@.*$/, '');
         for (const msg of result.messages) {
+          const senderId = String(msg.senderId || '').replace(/@.*$/, '');
+          const isSelf = senderId !== '' && senderId === ownFacebookId ? 1 : 0;
           db.saveFBMessage({
             id: msg.id,
             account_id: internalId,
             thread_id: params.threadId,
-            sender_id: msg.senderId,
+            sender_id: senderId,
             sender_name: msg.senderName || '',
             body: msg.body || null,
             timestamp: msg.timestampMs,
             type: msg.attachments?.length ? 'file' : 'text',
             attachments: msg.attachments?.length ? JSON.stringify(msg.attachments) : '[]',
             reply_to_id: msg.replyToMessageId || '',
-            is_self: String(msg.senderId) === internalId ? 1 : 0,
+            is_self: isSelf,
             is_unsent: msg.isUnsent ? 1 : 0,
             reactions: msg.reactions?.length ? JSON.stringify(msg.reactions) : '{}',
+            is_history: true,
           });
+
+          if (senderId) {
+            // saveFBMessage is intentionally insert-only for duplicate events.
+            // Reconcile existing rows while the history API still has the
+            // canonical participant id, so messages stored by an older client
+            // immediately regain the correct sender and direction on refresh.
+            db.run(
+              `UPDATE fb_messages
+               SET sender_id = ?, sender_name = CASE WHEN ? != '' THEN ? ELSE sender_name END, is_self = ?
+               WHERE id = ? AND account_id = ?`,
+              [senderId, msg.senderName || '', msg.senderName || '', isSelf, msg.id, internalId],
+            );
+            db.run(
+              `UPDATE messages SET sender_id = ?, is_sent = ?, status = ?
+               WHERE msg_id = ? AND owner_zalo_id = ? AND channel = 'facebook'`,
+              [senderId, isSelf, isSelf ? 'sent' : 'received', msg.id, ownFacebookId],
+            );
+          }
         }
         Logger.log(`[fb:fetchThreadMessages] Saved ${result.messages.length} messages to DB`);
       }
@@ -1738,9 +1825,9 @@ ipcMain.handle('fb:setGroupLink', async (_event, params: {
 
 /**
  * Auto-reconnect tất cả FB accounts khi app khởi động.
- * - Bỏ qua account đã connected
- * - Test cookie health trước khi connect
- * - Nếu cookie expired → bỏ qua (không thử)
+ * Uses exactly the same connection path as the dashboard. A socket status
+ * flag alone is not enough here: startup must wait for the MQTT transport and
+ * let the E2EE bridge initialize from its persisted device state.
  */
 export async function reconnectAllFBAccounts(): Promise<void> {
   try {
@@ -1748,46 +1835,16 @@ export async function reconnectAllFBAccounts(): Promise<void> {
     Logger.log(`[facebookIpc] reconnectAllFBAccounts: ${accounts.length} FB accounts found`);
     for (const acc of accounts) {
       try {
-        // Bỏ qua account đã connected
         const existing = FacebookConnectionManager.get(acc.id);
-        if (existing && existing.isConnected()) {
-          Logger.log(`[facebookIpc] reconnectAllFBAccounts ${acc.id}: already connected, skipping`);
+        if (existing && (existing.isListenerActuallyConnected() || existing.isE2EEConnected())) {
+          Logger.log(`[facebookIpc] reconnectAllFBAccounts ${acc.id}: transport already ready, skipping`);
           continue;
         }
-
-        const cookie = secureGet(fbCookieKey(acc.id)) || acc.cookie_encrypted;
-        if (!cookie) {
-          Logger.warn(`[facebookIpc] reconnectAllFBAccounts ${acc.id}: no cookie found, skipping`);
-          continue;
-        }
-
-        // Test cookie health trước khi connect
-        try {
-          const { checkCookieAlive } = require('../../src/services/facebook/FacebookSession');
-          const alive = await checkCookieAlive(cookie);
-          if (!alive) {
-            Logger.warn(`[facebookIpc] reconnectAllFBAccounts ${acc.id}: cookie expired, skipping`);
-            continue;
-          }
-        } catch (healthErr: any) {
-          Logger.warn(`[facebookIpc] reconnectAllFBAccounts ${acc.id}: health check failed: ${healthErr.message}, trying anyway`);
-        }
-
-        // Đọc proxy_id từ unified accounts table
-        let proxyId: number | null | undefined;
-        try {
-          const accRow = DatabaseService.getInstance().queryOne<any>('SELECT proxy_id FROM accounts WHERE zalo_id = ?', [acc.facebook_id || acc.id]);
-          proxyId = accRow?.proxy_id ?? null;
-        } catch { proxyId = null; }
-
-        const service = await FacebookConnectionManager.getOrCreate(acc.id, cookie, proxyId);
-        // Reset retry count sau khi connect thành công
-        if (service.isConnected()) {
-          service.resetListenerRetryCount?.();
-        }
-        Logger.log(`[facebookIpc] reconnectAllFBAccounts ${acc.id}: connected successfully`);
+        await connectFacebookAccount(acc.id, 'startup');
+        clearFacebookStartupRetry(acc.id);
       } catch (err: any) {
         Logger.warn(`[facebookIpc] reconnectAllFBAccounts ${acc.id}: ${err.message}`);
+        scheduleFacebookStartupRetry(acc.id, 0);
       }
     }
   } catch (err: any) {

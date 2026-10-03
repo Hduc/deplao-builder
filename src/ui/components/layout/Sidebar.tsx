@@ -11,6 +11,7 @@ import { useErpPermissions } from '@/hooks/erp/useErpContext';
 import { toLocalMediaUrl } from '@/lib/localMedia';
 import { BellIcon, BookIcon, BotIcon, BrainIcon, CampaignIcon, ChartIcon, ChatIcon, CheckIcon, CloudIcon, CreditCardIcon, DiamondIcon, DollarIcon, EditIcon, FileTextIcon, FolderIcon, GlobeIcon, HelpCircleIcon, LightningIcon, LinkIcon, LightbulbIcon, MailIcon, MessageCircleIcon, PackageIcon, RefreshIcon, SaveIcon, SearchIcon, SettingsIcon, ShoppingCartIcon, SmartphoneIcon, StoreIcon, SunIcon, TagIcon, TrendingUpIcon, TruckIcon, UserIcon, UsersIcon, WaveIcon } from '@/components/common/icons';
 import { CHANNEL } from '@/lib/channelHelper';
+import { useFeatureVisibilityStore } from '@/store/featureVisibilityStore';
 
 
 interface SidebarProps {
@@ -49,6 +50,7 @@ export default function Sidebar({ onAddAccount }: SidebarProps) {
   // Use visible (filtered) accounts for rendering
   const accounts = visibleAccounts;
   const { view, setView, mergedInboxMode, mergedInboxAccounts, mergedInboxFilterAccount, setMergedInboxFilter, exitMergedInbox, sidebarExpanded, toggleSidebarExpanded } = useAppStore();
+  const featureVisibility = useFeatureVisibilityStore(state => state.enabled);
   const crmRequestUnseenByAccount = useAppStore(s => s.crmRequestUnseenByAccount);
   const { contacts, activeThreadId, activeThreadType, saveAccountThread } = useChatStore();
   const { othersConversations: allOthers } = useAppStore();
@@ -378,35 +380,35 @@ export default function Sidebar({ onAddAccount }: SidebarProps) {
 
       {/* Nav bottom */}
       <div className="border-t border-gray-700 py-2 flex flex-col items-center gap-1">
-        <NavBtn icon="dashboard"  label="Dashboard"   active={view === 'dashboard'}  onClick={() => setView('dashboard')} />
-        {hasPerm('chat') && (
+        {featureVisibility.dashboard && <NavBtn icon="dashboard"  label="Dashboard"   active={view === 'dashboard'}  onClick={() => setView('dashboard')} />}
+        {featureVisibility.chat && hasPerm('chat') && (
         <NavBtn icon="chat"       label="Chat"         active={view === 'chat'}       onClick={() => setView('chat')} />
         )}
-        {hasPerm('crm') && (
+        {featureVisibility.crm && hasPerm('crm') && (
         <NavBtn icon="crm"        label="CRM"          active={view === 'crm'}        onClick={() => setView('crm')} dot={hasNewCRMRequests || hasScanNewDot} />
         )}
-        {(hasPerm('workflow') || hasPerm('integration')) && (
+        {((featureVisibility.workflow && hasPerm('workflow')) || (featureVisibility.integration && hasPerm('integration'))) && (
         <NavFlyout
           icon="tools"
           label="Công cụ"
           active={view === 'workflow' || view === 'integration'}
           items={[
-            ...(hasPerm('workflow') ? [{ icon: 'workflow' as const, label: 'Workflow (n8n)', active: view === 'workflow', onClick: () => setView('workflow') }] : []),
-            ...(hasPerm('integration') ? [{ icon: 'integration' as const, label: 'Tích hợp', active: view === 'integration', onClick: () => setView('integration') }] : []),
+            ...(featureVisibility.workflow && hasPerm('workflow') ? [{ icon: 'workflow' as const, label: 'Workflow (n8n)', active: view === 'workflow', onClick: () => setView('workflow') }] : []),
+            ...(featureVisibility.integration && hasPerm('integration') ? [{ icon: 'integration' as const, label: 'Tích hợp', active: view === 'integration', onClick: () => setView('integration') }] : []),
           ]}
           onGuide={() => setShowToolsGuide(true)}
         />
         )}
-        {hasPerm('analytics') && (
+        {featureVisibility.analytics && hasPerm('analytics') && (
         <NavBtn icon="analytics"  label="Báo cáo"      active={view === 'analytics'}  onClick={() => setView('analytics')} />
         )}
         {/* ERP - gated by module permission AND ERP RBAC (`erp.access`).
             Inside ERP, fine-grained writes enforced via `useErpPermissions().can(...)` +
             IPC middleware `withErpAuth`. */}
-        {hasPerm('erp') && canErpAccess && (
+        {featureVisibility.erp && hasPerm('erp') && canErpAccess && (
         <NavBtn icon="erp"        label="Quản lý công việc"   active={view === 'erp'}        onClick={() => setView('erp')} />
         )}
-        <NavBtn icon="settings"   label="Cài đặt"      active={view === 'settings'}   onClick={() => setView('settings')} dot={hasNewSettings} />
+        {featureVisibility.settings && <NavBtn icon="settings"   label="Cài đặt"      active={view === 'settings'}   onClick={() => setView('settings')} dot={hasNewSettings} />}
       </div>
 
       {/* Tools Guide Modal */}

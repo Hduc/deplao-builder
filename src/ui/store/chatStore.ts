@@ -86,6 +86,7 @@ export interface MessageItem {
   status: string;
   is_recalled?: number;  // 1 = tin nhắn đã thu hồi
   recalled_content?: string | null; // Nội dung gốc trước khi thu hồi
+  recalled_msg_type?: string | null; // Loại tin gốc trước khi thu hồi (ảnh/file/video...)
   is_edited?: number;    // 1 = tin nhắn đã chỉnh sửa
   edit_history?: string; // JSON array của các phiên bản cũ: [{oldBody, editedAt, editCount}]
   reactions?: ReactionData | Record<string, string> | string;
@@ -335,7 +336,16 @@ export const useChatStore = create<ChatStore>((set, get) => ({
       const merged = recalledMap.size > 0
         ? messages.map((m) => {
             const rec = recalledMap.get(String(m.msg_id));
-            if (rec) return { ...m, is_recalled: 1, status: 'recalled', msg_type: 'recalled', content: '', recalled_content: rec.recalled_content ?? m.content };
+            if (rec) return {
+              ...m,
+              is_recalled: 1,
+              status: 'recalled',
+              msg_type: 'recalled',
+              content: '',
+              recalled_content: rec.recalled_content ?? m.content,
+              recalled_msg_type: rec.recalled_msg_type
+                ?? (m.msg_type !== 'recalled' ? m.msg_type : null),
+            };
             return m;
           })
         : messages;
@@ -393,7 +403,15 @@ export const useChatStore = create<ChatStore>((set, get) => ({
         const newAttachments = message.attachments ? (typeof message.attachments === 'string' ? message.attachments : JSON.stringify(message.attachments)) : '';
         const existingHasAttachments = existingAttachments && existingAttachments !== '[]' && existingAttachments !== '""';
         const newHasAttachments = newAttachments && newAttachments !== '[]' && newAttachments !== '""';
-        const needsMerge = (newHasAttachments && !existingHasAttachments) || (message.msg_type && message.msg_type !== existingMsg.msg_type);
+        // Telegram poll updates reuse the original message id with refreshed
+        // result/option data. Unlike media echoes, both rows already have
+        // attachments, so accept a changed poll attachment explicitly.
+        const isTelegramPollUpdate = message.msg_type === 'telegram.poll'
+          && newHasAttachments
+          && newAttachments !== existingAttachments;
+        const needsMerge = (newHasAttachments && !existingHasAttachments)
+          || (message.msg_type && message.msg_type !== existingMsg.msg_type)
+          || isTelegramPollUpdate;
         if (needsMerge) {
           const merged = {
             ...existingMsg,
@@ -678,11 +696,15 @@ export const useChatStore = create<ChatStore>((set, get) => ({
           const originalContent = alreadyRecalled
             ? (updated[idx].recalled_content ?? updated[idx].content ?? null) // preserve existing
             : (updated[idx].content || null);                                   // capture original
+          const originalMsgType = alreadyRecalled
+            ? (updated[idx].recalled_msg_type ?? null)
+            : (updated[idx].msg_type !== 'recalled' ? updated[idx].msg_type : null);
           updated[idx] = {
             ...updated[idx],
             msg_type: 'recalled',
             content: '',
             recalled_content: originalContent,
+            recalled_msg_type: originalMsgType,
             status: 'recalled',
             is_recalled: 1,
           };

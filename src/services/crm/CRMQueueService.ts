@@ -8,6 +8,7 @@ import imageSize from 'image-size';
 import { parseMarkup } from './message-markup';
 import * as TelegramUser from '../telegram/TelegramUserListener';
 import * as TelegramBot from '../telegram/TelegramBotChannelService';
+import { buildPersonalizedVariables, replaceTemplateVariables } from './vietnameseNameUtils';
 
 /**
  * CRMQueueService - chạy trong main process
@@ -246,11 +247,28 @@ class CRMQueueService {
                 }
             }
 
+            // ── Personalized Variables & Auto Zalo Alias ───────────────────
+            const contactPhone = (item as any).phone || (effectiveContactId.startsWith('phone:') ? effectiveContactId.slice(6) : '');
+            const rawCustName = effectiveDisplayName || item.display_name || '';
+            const vars = buildPersonalizedVariables(rawCustName, contactPhone);
+
+            // Tự động lưu tên gợi nhớ (alias) Zalo: [Họ và tên] [SĐT]
+            if (channel === 'zalo' && /^\\d{5,}$/.test(effectiveContactId)) {
+                const targetAlias = vars.alias;
+                if (targetAlias && typeof (conn?.api as any)?.changeFriendAlias === 'function') {
+                    (conn.api as any).changeFriendAlias(targetAlias, effectiveContactId)
+                        .then(() => Logger.log(`[CRMQueue] Đã đổi tên gợi nhớ Zalo: "${targetAlias}" cho UID ${effectiveContactId}`))
+                        .catch((aliasErr: any) => Logger.debug(`[CRMQueue] Không thể đổi tên gợi nhớ cho ${effectiveContactId}: ${aliasErr.message}`));
+                }
+            }
+
             // ── Template preparation ───────────────────────────────────────
-            substitute = (tpl: string) =>
-                (tpl || '')
-                    .replace(/\{name\}/g, effectiveDisplayName || item.contact_id)
-                    .replace(/\{userId\}/g, effectiveContactId);
+            substitute = (tpl: string) => {
+                if (!tpl) return '';
+                let res = replaceTemplateVariables(tpl, vars);
+                res = res.replace(/\{userId\}|\{\{\s*userId\s*\}\}/g, effectiveContactId);
+                return res;
+            };
 
             campaignType = (item as any).campaign_type || 'message';
             isGroup = (item as any).contact_type === 'group';
@@ -557,22 +575,32 @@ class CRMQueueService {
 
         } catch (err: any) {
             const errMsg = err?.message || String(err);
-            Logger.error(`[CRMQueue] ❌ Failed to send to ${effectiveContactId}: ${errMsg}`);
+            const isBlocked = isZaloBlockError(err);
+            const errorFormatted = isBlocked ? `[ZALO CHẶN / GIỚI HẠN] ${errMsg}` : errMsg;
+
+            if (isBlocked) {
+                Logger.error(`[CRMQueue] 🚨 [ZALO CHẶN] Tài khoản ${zaloId} bị Zalo chặn khi gửi tới ${effectiveContactId}: ${errMsg}`);
+                EventBroadcaster.emit('crm:zaloBlocked', { zaloId, campaignId: item.campaign_id, contactId: effectiveContactId, error: errMsg });
+            } else {
+                Logger.error(`[CRMQueue] ❌ Failed to send to ${effectiveContactId}: ${errMsg}`);
+            }
+
             // Always save log on failure - use describeBlock for human-readable message
             const fallbackLogMsg = blocksToSend.length > 0
                 ? blocksToSend.map(describeBlock).join(' | ')
                 : (item.template_message || '(unknown)');
             try {
-                db.updateCampaignContactStatus(item.id!, 'failed', errMsg);
+                db.updateCampaignContactStatus(item.id!, 'failed', errorFormatted);
                 // Capture error response details if available
                 const errResponse: any = {
                     error: true,
-                    message: errMsg,
+                    isBlocked,
+                    message: errorFormatted,
                     errorCode: err?.errorCode ?? err?.code ?? err?.error_code ?? undefined,
                 };
                 db.saveSendLog({ ...logBase,
-                    message: `[Lỗi] ${errMsg} - ${fallbackLogMsg}`,
-                    status: 'failed', error: errMsg,
+                    message: `[${isBlocked ? 'Zalo Chặn' : 'Lỗi'}] ${errMsg} - ${fallbackLogMsg}`,
+                    status: 'failed', error: errorFormatted,
                     send_type: campaignType === 'friend_request' ? 'friend_request' : campaignType === 'mixed' ? 'mixed' : 'message',
                     data_request: JSON.stringify({ type: campaignType, contact_id: effectiveContactId }),
                     data_response: JSON.stringify(errResponse) });
@@ -580,7 +608,7 @@ class CRMQueueService {
             } catch (logErr: any) {
                 Logger.error(`[CRMQueue] ❌ Failed to save error log: ${logErr.message}`);
             }
-            this.broadcastProgress(zaloId, item.campaign_id, effectiveContactId, 'failed', errMsg);
+            this.broadcastProgress(zaloId, item.campaign_id, effectiveContactId, 'failed', errorFormatted);
             this.checkCampaignCompletion(item.campaign_id, zaloId);
         } finally {
             this.isProcessing.set(zaloId, false);
@@ -660,6 +688,28 @@ class CRMQueueService {
 }
 
 export default CRMQueueService;
+
+/**
+ * Kiểm tra lỗi Zalo chặn hoặc rate limit
+ */
+function isZaloBlockError(err: any): boolean {
+    const code = Number(err?.errorCode ?? err?.code ?? err?.error_code ?? -1);
+    if ([4, 9, 214, 216, 221, 576, 579, 1000, 1001, 1002].includes(code)) return true;
+    const msg = String(err?.message || '').toLowerCase();
+    return (
+        msg.includes('block') ||
+        msg.includes('chặn') ||
+        msg.includes('spam') ||
+        msg.includes('tạm khóa') ||
+        msg.includes('giới hạn') ||
+        msg.includes('hạn chế') ||
+        msg.includes('rate limit') ||
+        msg.includes('quá số lượng') ||
+        msg.includes('người lạ') ||
+        msg.includes('stranger') ||
+        msg.includes('permission')
+    );
+}
 
 /**
  * Kiểm tra lỗi gửi tin nhắn có phải do người dùng chặn người lạ không.

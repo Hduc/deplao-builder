@@ -10,6 +10,8 @@ agents/
 .env.local
 .env.production
 *.log
+*.json.key
+aigiuptech-*.json
 data/*
 .DS_Store
 tmp/

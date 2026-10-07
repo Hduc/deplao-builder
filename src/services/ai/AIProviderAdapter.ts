@@ -110,6 +110,20 @@ function geminiPayload(messages: AIProviderMessage[], model: string, maxTokens: 
 
 /** Provider-specific request and response adaptation shared by Assistants and Workflow. */
 export async function requestAICompletion(request: AICompletionRequest): Promise<AICompletionResponse> {
+  const RETRY_DELAY_MS = 30000; // Thử lại sau 30s khi model lỗi
+
+  while (true) {
+    try {
+      return await executeSingleAICompletion(request);
+    } catch (err: any) {
+      const errMsg = err?.response?.data?.error?.message || err?.response?.data?.error || err?.message || String(err);
+      console.warn(`[AI Completion] Model call failed: ${errMsg}. Retrying after ${RETRY_DELAY_MS / 1000}s...`);
+      await new Promise(resolve => setTimeout(resolve, RETRY_DELAY_MS));
+    }
+  }
+}
+
+async function executeSingleAICompletion(request: AICompletionRequest): Promise<AICompletionResponse> {
   const platform = String(request.platform || 'openai').toLowerCase();
   const model = normalizeAIModel(platform, request.model);
   const maxTokens = Math.max(1, Math.floor(Number(request.maxTokens) || 500));

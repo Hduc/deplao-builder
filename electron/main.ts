@@ -1170,6 +1170,13 @@ app.whenReady().then(async () => {
   createTray();
   registerWindowControls();
 
+  // Start CRM Gateway immediately on port 9889
+  WebhookGatewayService.getInstance().start(9889).then(result => {
+    console.log('[main] CRM WebhookGateway started on port', result.port);
+  }).catch(err => {
+    console.error('[main] CRM WebhookGateway failed to start:', err);
+  });
+
   // `ready-to-show` is a Chromium paint signal, not proof that React has
   // mounted. Start network recovery only after the renderer itself reports a
   // committed frame, otherwise a slow cold Vite load competes with Telegram,

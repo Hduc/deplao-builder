@@ -75,10 +75,126 @@ class WebhookGatewayService {
         this.handleWorkflowWebhook(req, res, parsed);
       });
 
+      // Register direct CRM gateway routes
+      this.registerRoute('/api/crm/ping', (req, res) => {
+        try {
+          const db = require('../database/DatabaseService').default.getInstance();
+          const accounts = db.getAccounts().map((a: any) => ({
+            zaloId: a.zalo_id,
+            name: a.full_name,
+            phone: a.phone,
+            avatar: a.avatar_url,
+            status: a.status,
+            channel: a.channel || 'zalo',
+          }));
+          this.json(res, 200, {
+            success: true,
+            status: 'online',
+            service: 'deplao-crm-gateway',
+            machineTime: Date.now(),
+            accounts,
+          });
+        } catch (err: any) {
+          this.json(res, 500, { success: false, error: err.message });
+        }
+      });
+
+      this.registerRoute('/api/crm/send-message', async (req, res, parsed) => {
+        try {
+          const { senderId, targetPhone, targetUid, message } = parsed.body || {};
+          if (!senderId || !message) {
+            this.json(res, 400, { success: false, error: 'Thiếu senderId hoặc message' });
+            return;
+          }
+
+          const ZaloService = require('../zalo/ZaloService').default;
+          const zaloSvc = ZaloService.getInstance(senderId);
+          if (!zaloSvc || !zaloSvc.api) {
+            this.json(res, 400, { success: false, error: `Tài khoản ${senderId} chưa kết nối Zalo` });
+            return;
+          }
+
+          let effectiveUid = targetUid;
+          if (!effectiveUid && targetPhone) {
+            const findRes = await zaloSvc.findUser(targetPhone).catch(() => null);
+            const found = findRes?.data || findRes;
+            effectiveUid = found?.userId || found?.uid || found?.id;
+          }
+
+          if (!effectiveUid) {
+            this.json(res, 404, { success: false, error: 'Không tìm thấy Zalo UID từ SĐT' });
+            return;
+          }
+
+          const sendRes = await zaloSvc.sendMessage(message, effectiveUid, 0);
+          this.json(res, 200, { success: true, data: sendRes, targetUid: effectiveUid });
+        } catch (err: any) {
+          this.json(res, 500, { success: false, error: err.message });
+        }
+      });
+
+      this.registerRoute('/api/crm/friend-request', async (req, res, parsed) => {
+        try {
+          const { senderId, targetPhone, targetUid, message } = parsed.body || {};
+          if (!senderId) {
+            this.json(res, 400, { success: false, error: 'Thiếu senderId' });
+            return;
+          }
+
+          const ZaloService = require('../zalo/ZaloService').default;
+          const zaloSvc = ZaloService.getInstance(senderId);
+          if (!zaloSvc || !zaloSvc.api) {
+            this.json(res, 400, { success: false, error: `Tài khoản ${senderId} chưa kết nối Zalo` });
+            return;
+          }
+
+          let effectiveUid = targetUid;
+          if (!effectiveUid && targetPhone) {
+            const findRes = await zaloSvc.findUser(targetPhone).catch(() => null);
+            const found = findRes?.data || findRes;
+            effectiveUid = found?.userId || found?.uid || found?.id;
+          }
+
+          if (!effectiveUid) {
+            this.json(res, 404, { success: false, error: 'Không tìm thấy Zalo UID từ SĐT' });
+            return;
+          }
+
+          const reqMsg = message || 'Chào bạn, mình kết bạn nhé!';
+          const frRes = await zaloSvc.sendFriendRequest(reqMsg, effectiveUid);
+          this.json(res, 200, { success: true, data: frRes, targetUid: effectiveUid });
+        } catch (err: any) {
+          this.json(res, 500, { success: false, error: err.message });
+        }
+      });
+
+      this.registerRoute('/api/crm/resolve-phone', async (req, res, parsed) => {
+        try {
+          const { senderId, phone } = parsed.body || {};
+          if (!senderId || !phone) {
+            this.json(res, 400, { success: false, error: 'Thiếu senderId hoặc phone' });
+            return;
+          }
+
+          const ZaloService = require('../zalo/ZaloService').default;
+          const zaloSvc = ZaloService.getInstance(senderId);
+          if (!zaloSvc || !zaloSvc.api) {
+            this.json(res, 400, { success: false, error: `Tài khoản ${senderId} chưa sẵn sàng` });
+            return;
+          }
+
+          const findRes = await zaloSvc.findUser(phone);
+          const found = findRes?.data || findRes;
+          this.json(res, 200, { success: true, data: found });
+        } catch (err: any) {
+          this.json(res, 500, { success: false, error: err.message });
+        }
+      });
+
       return new Promise((resolve) => {
-        this.server!.listen(this.port, '127.0.0.1', () => {
+        this.server!.listen(this.port, '0.0.0.0', () => {
           this.running = true;
-          Logger.log(`[WebhookGateway] ✅ Server listening on http://127.0.0.1:${this.port}`);
+          Logger.log(`[WebhookGateway] ✅ Server listening on http://0.0.0.0:${this.port}`);
           resolve({ success: true, port: this.port });
         });
         this.server!.on('error', (err: any) => {
@@ -204,21 +320,18 @@ class WebhookGatewayService {
 
     const remoteIp = req.socket?.remoteAddress || '';
 
-    // Parse body
-    let bodyRaw = '';
-    req.on('data', (chunk: Buffer) => { bodyRaw += chunk.toString(); });
-    req.on('end', () => {
+    const dispatch = (raw: string) => {
       let body: any = {};
       try {
-        body = bodyRaw ? JSON.parse(bodyRaw) : {};
+        body = raw ? JSON.parse(raw) : {};
       } catch {
-        body = { raw: bodyRaw };
+        body = { raw };
       }
 
       const parsed = {
         pathname,
         body,
-        rawBody: bodyRaw,
+        rawBody: raw,
         query,
         headers,
         method: req.method || 'GET',
@@ -228,14 +341,22 @@ class WebhookGatewayService {
       // 1. Try exact match
       const exactHandler = this.routes.get(pathname);
       if (exactHandler) {
-        exactHandler(req, res, parsed);
+        try {
+          exactHandler(req, res, parsed);
+        } catch (hErr: any) {
+          this.json(res, 500, { success: false, error: hErr.message });
+        }
         return;
       }
 
       // 2. Try prefix match
       for (const { prefix, handler } of this.prefixRoutes) {
         if (pathname.startsWith(prefix)) {
-          handler(req, res, parsed);
+          try {
+            handler(req, res, parsed);
+          } catch (hErr: any) {
+            this.json(res, 500, { success: false, error: hErr.message });
+          }
           return;
         }
       }
@@ -249,7 +370,16 @@ class WebhookGatewayService {
       // 4. Not found
       Logger.warn(`[WebhookGateway] Route not found: ${req.method} ${pathname}`);
       this.json(res, 404, { success: false, error: 'Route not found' });
-    });
+    };
+
+    if (req.method === 'GET' || req.method === 'HEAD') {
+      dispatch('');
+    } else {
+      let bodyRaw = '';
+      req.on('data', (chunk: Buffer) => { bodyRaw += chunk.toString(); });
+      req.on('end', () => { dispatch(bodyRaw); });
+      req.on('error', (err) => { this.json(res, 400, { success: false, error: err.message }); });
+    }
   }
 
   // ─── Workflow Webhook Handler ────────────────────────────────────

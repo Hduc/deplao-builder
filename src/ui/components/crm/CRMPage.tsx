@@ -663,10 +663,9 @@ export default function CRMPage() {
       {/* Top bar */}
       <div className="flex items-center gap-3 px-5 py-3 border-b border-gray-700 flex-shrink-0 bg-gray-850">
         <div className="flex bg-gray-800 rounded-lg p-0.5">
-          {(['search', 'contacts', 'groups', 'requests', 'campaigns', 'history', 'scan', 'scan_history', 'scan_stats'] as const).filter(t => {
+          {(['search', 'contacts', 'groups', 'requests', 'history', 'scan', 'scan_history', 'scan_stats'] as const).filter(t => {
             if (t === 'search') return channelCap.supportsCRMSearch;
             if (t === 'requests') return channelCap.supportsFriendRequest;
-            if (t === 'campaigns') return channelCap.supportsCampaigns;
             if (t === 'history') return channelCap.supportsCRMHistory;
             if (t === 'groups') return channelCap.supportsCRMGroups;
             if (t === 'scan' || t === 'scan_history' || t === 'scan_stats') return channelCap.supportsScanData;
@@ -698,7 +697,6 @@ export default function CRMPage() {
                     )}
                   </span>
                 )
-                : t === 'campaigns' ? <><CampaignIcon className="w-4 h-4 mr-2" /> Chiến dịch{store.campaigns.length ? ` (${store.campaigns.length})` : ''}</>
                 : t === 'history' ? <><ClipboardListIcon className="w-4 h-4 mr-2" /> Lịch sử</>
                 : t === 'scan' ? <><SearchIcon className="w-4 h-4 mr-2" /> Quét dữ liệu</>
                 : t === 'scan_history' ? <><ClipboardListIcon className="w-4 h-4 mr-2" /> Lịch sử quét</>

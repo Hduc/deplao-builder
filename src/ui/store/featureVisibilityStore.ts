@@ -16,7 +16,7 @@ const DEFAULT_VISIBILITY: Record<FeatureVisibilityKey, boolean> = {
   dashboard: true,
   chat: true,
   crm: true,
-  workflow: true,
+  workflow: false,
   integration: true,
   analytics: true,
   erp: true,
@@ -26,12 +26,12 @@ const DEFAULT_VISIBILITY: Record<FeatureVisibilityKey, boolean> = {
 function loadVisibility(): Record<FeatureVisibilityKey, boolean> {
   try {
     const raw = localStorage.getItem(STORAGE_KEY);
-    if (!raw) return { ...DEFAULT_VISIBILITY };
+    if (!raw) return { ...DEFAULT_VISIBILITY, workflow: false };
     const parsed = JSON.parse(raw) as Partial<Record<FeatureVisibilityKey, boolean>>;
     // Dashboard and Chat are core navigation and are intentionally not toggleable.
-    return { ...DEFAULT_VISIBILITY, ...parsed, dashboard: true, chat: true };
+    return { ...DEFAULT_VISIBILITY, ...parsed, dashboard: true, chat: true, workflow: false };
   } catch {
-    return { ...DEFAULT_VISIBILITY };
+    return { ...DEFAULT_VISIBILITY, workflow: false };
   }
 }
 

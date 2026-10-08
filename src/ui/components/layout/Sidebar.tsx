@@ -387,14 +387,13 @@ export default function Sidebar({ onAddAccount }: SidebarProps) {
         {featureVisibility.crm && hasPerm('crm') && (
         <NavBtn icon="crm"        label="CRM"          active={view === 'crm'}        onClick={() => setView('crm')} dot={hasNewCRMRequests || hasScanNewDot} />
         )}
-        {((featureVisibility.workflow && hasPerm('workflow')) || (featureVisibility.integration && hasPerm('integration'))) && (
+        {featureVisibility.integration && hasPerm('integration') && (
         <NavFlyout
           icon="tools"
           label="Công cụ"
-          active={view === 'workflow' || view === 'integration'}
+          active={view === 'integration'}
           items={[
-            ...(featureVisibility.workflow && hasPerm('workflow') ? [{ icon: 'workflow' as const, label: 'Workflow (n8n)', active: view === 'workflow', onClick: () => setView('workflow') }] : []),
-            ...(featureVisibility.integration && hasPerm('integration') ? [{ icon: 'integration' as const, label: 'Tích hợp', active: view === 'integration', onClick: () => setView('integration') }] : []),
+            { icon: 'integration' as const, label: 'Tích hợp', active: view === 'integration', onClick: () => setView('integration') },
           ]}
           onGuide={() => setShowToolsGuide(true)}
         />

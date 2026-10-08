@@ -253,7 +253,7 @@ class CRMQueueService {
             const vars = buildPersonalizedVariables(rawCustName, contactPhone);
 
             // Tự động lưu tên gợi nhớ (alias) Zalo: [Họ và tên] [SĐT]
-            if (channel === 'zalo' && /^\\d{5,}$/.test(effectiveContactId)) {
+            if (channel === 'zalo' && /^\d{5,}$/.test(effectiveContactId)) {
                 const targetAlias = vars.alias;
                 if (targetAlias && typeof (conn?.api as any)?.changeFriendAlias === 'function') {
                     (conn.api as any).changeFriendAlias(targetAlias, effectiveContactId)

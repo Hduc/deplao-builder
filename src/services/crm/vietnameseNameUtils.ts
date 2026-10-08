@@ -34,8 +34,8 @@ export interface PersonalizedVars {
 export function extractShortName(fullName: string): string {
   if (!fullName) return '';
   const clean = fullName.trim();
-  if (!clean || clean.startsWith('KH ') || clean.startsWith('Bạn bè ')) {
-    return clean;
+  if (!clean || clean.startsWith('KH ') || clean.startsWith('Bạn bè ') || /^(\+?84|0)?[1-9]\d{8}$/.test(clean)) {
+    return '';
   }
   const parts = clean.split(/\s+/).filter(Boolean);
   if (parts.length === 0) return '';
@@ -152,9 +152,18 @@ export function parseSpintax(text: string): string {
 
 export function replaceTemplateVariables(template: string, vars: PersonalizedVars): string {
   if (!template) return '';
-  let replaced = template
+  let replaced = template;
+
+  // Nếu không có tên riêng (placeholder KH/SĐT), gộp cụm xung_ho + ten thành danh_xung/xung_ho
+  if (!vars.shortName) {
+    replaced = replaced
+      .replace(/\{\{\s*xung_ho\s*\}\}\s+\{\{\s*(ten|short_name)\s*\}\}/gi, vars.salutation || vars.honorific)
+      .replace(/\{xung_ho\}\s+\{(ten|short_name)\}/gi, vars.salutation || vars.honorific);
+  }
+
+  replaced = replaced
     .replace(/\{\{\s*xung_ho\s*\}\}|\{xung_ho\}/gi, vars.honorific)
-    .replace(/\{\{\s*(ten|short_name)\s*\}\}|\{(ten|short_name)\}/gi, vars.shortName || 'bạn')
+    .replace(/\{\{\s*(ten|short_name)\s*\}\}|\{(ten|short_name)\}/gi, vars.shortName || (vars.honorific !== 'anh/chị' ? '' : 'bạn'))
     .replace(/\{\{\s*danh_xung\s*\}\}|\{danh_xung\}/gi, vars.salutation || 'bạn')
     .replace(/\{\{\s*name\s*\}\}|\{name\}/gi, vars.salutation || vars.shortName || 'bạn')
     .replace(/\{\{\s*(full_name|ho_ten)\s*\}\}|\{(full_name|ho_ten)\}/gi, vars.fullName || 'Quý khách')

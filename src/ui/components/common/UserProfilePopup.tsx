@@ -335,7 +335,14 @@ export function UserProfilePopup({ userId, anchorX, anchorY, contacts, activeAcc
     return '**/**/****';
   };
 
-  const handleOpenChat = () => { setActiveThread(userId, 0); setView('chat'); onClose(); };
+  const handleOpenChat = () => {
+    if (activeAccountId) {
+      useAccountStore.getState().setActiveAccount(activeAccountId);
+    }
+    setActiveThread(userId, 0);
+    setView('chat');
+    onClose();
+  };
 
   // ── Add-friend inline compose ──────────────────────────────────────────
   const [friendCompose, setFriendCompose] = React.useState(false);
